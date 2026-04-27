@@ -6,6 +6,20 @@
 
 ---
 
+> [!WARNING]
+> **⚠ AI-Assisted Project — Read Before Using**
+>
+> This project was built with significant assistance from GitHub Copilot (AI). While it works for my personal use, you should expect:
+> - Bugs, edge cases, and unexpected behaviour
+> - Incomplete error handling in certain paths
+> - Features that may break on different system setups
+>
+> **This tool was made for personal use only.** I'm sharing it because people asked, not because it's production-ready or officially supported. Use it at your own risk, and don't expect regular maintenance or support.
+>
+> If something breaks — open an issue or fix it yourself. It's all just Python and shell scripts.
+
+---
+
 ## Table of Contents
 
 - [Features](#features)
