@@ -53,6 +53,14 @@
 - **Python 3.10 or newer** — [python.org/downloads](https://www.python.org/downloads/)
 - No extra pip packages required (stdlib only)
 
+### .NET Runtimes
+
+| Runtime | Version | Required by | Auto-install |
+|---|---|---|---|
+| [.NET 8.0 Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) | 8.x | AssetStudio.CLI | ✅ via `setup.py` |
+
+> **maiforge** is published as a self-contained single-file binary — no .NET installation needed for it.
+
 ### External tools
 
 | Tool | Used for | Auto-install | Manual download |
@@ -73,7 +81,11 @@
 git clone https://github.com/LonerYlon/maiconverter.git
 cd maiconverter
 
-# 2. Run the first-time setup (checks tools, auto-downloads what it can)
+# 2. Run the first-time setup
+#    - Checks Python version
+#    - Checks & installs .NET 8.0 Runtime if missing (needed by AssetStudio CLI)
+#    - Auto-downloads ffmpeg and vgmstream
+#    - Shows manual download links for flac, crid, AssetStudio
 python setup.py
 
 # 3. For tools that require manual download, follow the printed instructions.

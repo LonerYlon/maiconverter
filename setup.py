@@ -7,6 +7,7 @@ Run this once before using maimai.py to verify / install all required tools.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import urllib.request
 import zipfile
@@ -176,6 +177,125 @@ def check_python():
     return True
 
 
+# ── .NET runtime checks ───────────────────────────────────────────────────────
+
+# Tools that need a specific .NET runtime (not self-contained)
+DOTNET_REQUIREMENTS = [
+    {
+        "label":   "AssetStudio.CLI.exe",
+        "version": "8.0",
+        "major":   8,
+        "installer_url": (
+            "https://aka.ms/dotnet/8.0/dotnet-runtime-win-x64.exe"
+        ),
+        "installer_name": "dotnet-runtime-8.0-win-x64.exe",
+        "info_url": "https://dotnet.microsoft.com/en-us/download/dotnet/8.0",
+    },
+]
+
+
+def _get_installed_dotnet_versions() -> list[str]:
+    """Returns a list of installed .NET runtime version strings, e.g. ['6.0.25', '8.0.4']."""
+    try:
+        result = subprocess.run(
+            ["dotnet", "--list-runtimes"],
+            capture_output=True, text=True, timeout=10
+        )
+        versions = []
+        for line in result.stdout.splitlines():
+            # Lines look like: Microsoft.NETCore.App 8.0.4 [C:\Program Files\dotnet\...]
+            if line.startswith("Microsoft.NETCore.App"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    versions.append(parts[1])
+        return versions
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
+def _dotnet_runtime_ok(required_major: int, installed: list[str]) -> str | None:
+    """Returns the version string if a matching major is installed, else None."""
+    for v in installed:
+        try:
+            if int(v.split(".")[0]) == required_major:
+                return v
+        except ValueError:
+            pass
+    return None
+
+
+def _install_dotnet_runtime(req: dict) -> bool:
+    """Download and silently run the .NET runtime installer."""
+    tmp = ROOT / req["installer_name"]
+    try:
+        download_with_progress(req["installer_url"], tmp)
+        print(f"  Running installer (UAC prompt may appear)...")
+        result = subprocess.run(
+            [str(tmp), "/install", "/quiet", "/norestart"],
+            timeout=300
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(ERR(f"    Installer failed: {e}"))
+        return False
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def check_dotnet_runtimes() -> bool:
+    """Check all required .NET runtimes. Returns True if all present."""
+    installed = _get_installed_dotnet_versions()
+
+    all_ok = True
+    for req in DOTNET_REQUIREMENTS:
+        found = _dotnet_runtime_ok(req["major"], installed)
+        if found:
+            print(OK(f"  ✓ .NET {req['major']}.x  (found {found})  — required by {req['label']}"))
+        else:
+            print(ERR(f"  ✗ .NET {req['major']}.x  — required by {req['label']}"))
+            all_ok = False
+
+    return all_ok
+
+
+def offer_dotnet_install() -> list[str]:
+    """Offer to auto-install missing .NET runtimes. Returns list of still-missing major versions."""
+    installed = _get_installed_dotnet_versions()
+    missing = [r for r in DOTNET_REQUIREMENTS if not _dotnet_runtime_ok(r["major"], installed)]
+    if not missing:
+        return []
+
+    print(BOLD("\n[ .NET Runtime — Auto-install ]"))
+    for req in missing:
+        print(f"  {WARN('!')} .NET {req['version']} Runtime is missing.")
+        print(DIM(f"      Info: {req['info_url']}"))
+
+    ans = input(
+        f"\n  Download and install {len(missing)} .NET runtime(s) automatically? (y/n): "
+    ).strip().lower()
+
+    still_missing = []
+    if ans == "y":
+        for req in missing:
+            print(f"\n  Downloading .NET {req['version']} Runtime installer...")
+            ok = _install_dotnet_runtime(req)
+            # re-check after install
+            new_installed = _get_installed_dotnet_versions()
+            if ok and _dotnet_runtime_ok(req["major"], new_installed):
+                print(OK(f"  ✓ .NET {req['version']} Runtime installed successfully."))
+            else:
+                print(ERR(f"  ✗ .NET {req['version']} Runtime install failed."))
+                print(WARN(f"    Please install manually: {req['info_url']}"))
+                still_missing.append(req["version"])
+    else:
+        for req in missing:
+            print(WARN(f"  Please install .NET {req['version']} Runtime manually: {req['info_url']}"))
+            still_missing.append(req["version"])
+
+    return still_missing
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def run_setup(force=False):
@@ -189,6 +309,15 @@ def run_setup(force=False):
     print(BOLD("[ Python ]"))
     py_ok = check_python()
     print()
+
+    # ── .NET Runtimes ─────────────────────────────────────────
+    print(BOLD("[ .NET Runtimes ]"))
+    dotnet_ok = check_dotnet_runtimes()
+    print()
+    missing_dotnet = []
+    if not dotnet_ok:
+        missing_dotnet = offer_dotnet_install()
+        print()
 
     # ── Tools ─────────────────────────────────────────────────
     print(BOLD("[ Tools ]"))
@@ -239,15 +368,17 @@ def run_setup(force=False):
     remaining = [t for t in TOOLS if not find_tool(t)]
     state = {
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
-        "missing": [t["name"] for t in remaining],
-        "complete": len(remaining) == 0,
+        "missing_tools": [t["name"] for t in remaining],
+        "missing_dotnet": missing_dotnet,
+        "complete": len(remaining) == 0 and len(missing_dotnet) == 0,
     }
     SETUP_DONE.write_text(json.dumps(state, indent=2))
 
     if state["complete"]:
         print(OK("  Setup complete! You can now run:  python maimai.py"))
     else:
-        print(WARN(f"  Setup done with {len(remaining)} tool(s) still missing."))
+        issues = len(remaining) + len(missing_dotnet)
+        print(WARN(f"  Setup done with {issues} item(s) still missing."))
         print(WARN("  Those modes will ask you for the tool path when you first use them."))
 
     print()
