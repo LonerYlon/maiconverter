@@ -24,17 +24,17 @@ public static class ZipService
         ZipFile.CreateFromDirectory(sourceDir.FullName, zipFile.FullName);
     }
 
-    public static void ZipFolderAndMaybeDelete(DirectoryInfo sourceDir, bool deleteAfter, bool overwrite = true)
+    public static void ZipFolderAndMaybeDelete(DirectoryInfo sourceDir, bool deleteAfter, bool overwrite = true, string extension = ".zip")
     {
-        var zipPath = new FileInfo($"{sourceDir.FullName}.zip");
-        ZipDirectory(sourceDir, zipPath, overwrite);
+        var outPath = new FileInfo(Path.ChangeExtension(sourceDir.FullName, extension));
+        ZipDirectory(sourceDir, outPath, overwrite);
         if (deleteAfter)
         {
             sourceDir.Delete(true);
         }
     }
 
-    public static IReadOnlyList<FileInfo> ZipImmediateSubfolders(DirectoryInfo outputRoot, bool deleteAfter, bool overwrite = true)
+    public static IReadOnlyList<FileInfo> ZipImmediateSubfolders(DirectoryInfo outputRoot, bool deleteAfter, bool overwrite = true, string extension = ".zip")
     {
         if (!outputRoot.Exists)
         {
@@ -44,9 +44,9 @@ public static class ZipService
         var zips = new List<FileInfo>();
         foreach (var dir in outputRoot.EnumerateDirectories())
         {
-            var zipPath = new FileInfo($"{dir.FullName}.zip");
-            ZipDirectory(dir, zipPath, overwrite);
-            zips.Add(zipPath);
+            var outPath = new FileInfo(Path.ChangeExtension(dir.FullName, extension));
+            ZipDirectory(dir, outPath, overwrite);
+            zips.Add(outPath);
             if (deleteAfter)
             {
                 dir.Delete(true);

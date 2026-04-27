@@ -17,3 +17,6 @@ obj/
 # OS
 .DS_Store
 Thumbs.db
+
+# Setup state
+.setup_done

@@ -3,7 +3,11 @@ import sys
 import time
 import re
 import json
+import locale
 import argparse
+import subprocess
+import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from converters.flac import (
@@ -77,9 +81,10 @@ TOOL_CANDIDATES = {
         SCRIPT_ROOT / "flac" / "flac.exe",
         SCRIPT_ROOT / "flac.exe",
     ],
-    "MaichartConverter.exe": [
-        SCRIPT_ROOT / "maichartconverter" / "MaichartConverter.exe",
-        SCRIPT_ROOT / "MaichartConverter.exe",
+    "maiforge.exe": [
+        SCRIPT_ROOT / "maioconverter-custom" / "dist" / "win-x64" / "maiforge.exe",
+        SCRIPT_ROOT / "maiforge" / "maiforge.exe",
+        SCRIPT_ROOT / "maiforge.exe",
     ],
     "AssetStudio.CLI.exe": [
         SCRIPT_ROOT / "assetstudiocli" / "AssetStudio.CLI.exe",
@@ -187,6 +192,36 @@ def countdown_between_batches(seconds=10, completed_label=None):
             time.sleep(1)
 
     clear_screen()
+
+
+def countdown_after_conversion(seconds=5, label=None):
+    """Short countdown shown after a conversion finishes before proceeding."""
+    if CLI_MODE:
+        return
+
+    msg = label or "Continuing"
+
+    if WINDOWS:
+        for remaining in range(seconds, 0, -1):
+            sys.stdout.write(f"\r  {msg} in {remaining}s...  Press any key to skip.")
+            sys.stdout.flush()
+            start = time.time()
+            while time.time() - start < 1:
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                    sys.stdout.write("\r" + " " * 60 + "\r")
+                    sys.stdout.flush()
+                    return
+                time.sleep(0.05)
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+    else:
+        for remaining in range(seconds, 0, -1):
+            sys.stdout.write(f"\r  {msg} in {remaining}s...")
+            sys.stdout.flush()
+            time.sleep(1)
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
 
 
 def run_subprocess_safe(cmd, cwd=None):
@@ -465,6 +500,77 @@ def get_existing_auto_assets(axxx_paths, selected_targets):
 
     return existing_music, existing_cover, existing_video
 
+
+def detect_axxx_temp_assets(axxx_paths: list) -> dict:
+    """Scan AXXX folder(s) for pre-generated temp asset directories.
+    
+    Returns aggregate counts and per-folder info used for the status display.
+    """
+    n = len(axxx_paths)
+    music_total = 0
+    music_folders_with = 0
+    music_folders_partial = 0
+    cover_folders_with = 0
+    cover_folders_partial = 0
+    video_total = 0
+    video_folders_with = 0
+    video_folders_partial = 0
+    music_source_count = 0
+    cover_source_count = 0
+    video_source_count = 0
+
+    for axxx in axxx_paths:
+        mp3_count = count_existing_files_with_ext(axxx / "musicMP3", ".mp3")
+        awb_count = count_existing_files_with_ext(axxx / "SoundData", ".awb")
+        music_complete = mp3_count > 0 and (awb_count == 0 or mp3_count >= awb_count)
+        music_partial = mp3_count > 0 and not music_complete
+        if music_complete:
+            music_total += mp3_count
+            music_folders_with += 1
+        elif music_partial:
+            music_folders_partial += 1
+
+        cover_png_count = len(list((axxx / "Jackets").glob("*.png"))) if (axxx / "Jackets").is_dir() else 0
+        ab_count = count_existing_files_with_ext(axxx / "AssetBundleImages" / "jacket", ".ab")
+        cover_complete = cover_png_count > 0 and (ab_count == 0 or cover_png_count >= ab_count)
+        cover_partial = cover_png_count > 0 and not cover_complete
+        if cover_complete:
+            cover_folders_with += 1
+        elif cover_partial:
+            cover_folders_partial += 1
+
+        mp4_count = count_existing_files_with_ext(axxx / "Movie", ".mp4")
+        dat_count = count_existing_files_with_ext(axxx / "MovieData", ".dat")
+        video_complete = mp4_count > 0 and (dat_count == 0 or mp4_count >= dat_count)
+        video_partial = mp4_count > 0 and not video_complete
+        if video_complete:
+            video_total += mp4_count
+            video_folders_with += 1
+        elif video_partial:
+            video_folders_partial += 1
+
+        if awb_count > 0:
+            music_source_count += 1
+        if ab_count > 0:
+            cover_source_count += 1
+        if dat_count > 0:
+            video_source_count += 1
+
+    return {
+        "n_folders": n,
+        "music_total": music_total,
+        "music_folders_with": music_folders_with,
+        "music_folders_partial": music_folders_partial,
+        "cover_folders_with": cover_folders_with,
+        "cover_folders_partial": cover_folders_partial,
+        "video_total": video_total,
+        "video_folders_with": video_folders_with,
+        "video_folders_partial": video_folders_partial,
+        "music_source_count": music_source_count,
+        "cover_source_count": cover_source_count,
+        "video_source_count": video_source_count,
+    }
+
 # =========================================================
 # REQUIREMENTS / TOOLS
 # =========================================================
@@ -477,10 +583,10 @@ def requirements_for_mode(mode):
     if mode == "3":
         return ["vgmstream-cli.exe", "flac.exe", "ffmpeg.exe"]
     if mode == "4":
-        return ["MaichartConverter.exe"]
+        return ["maiforge.exe"]
     if mode == "5":
         return [
-            "MaichartConverter.exe",
+            "maiforge.exe",
             "vgmstream-cli.exe",
             "ffmpeg.exe",
             "crid_mod.exe",
@@ -565,6 +671,23 @@ def scene_main_menu():
     print("[6] Image Conversion (.ab)")
     print("[0] Exit")
     print()
+
+    # Quick tool status row
+    tool_checks = [
+        ("vgmstream", "vgmstream-cli.exe"),
+        ("ffmpeg",    "ffmpeg.exe"),
+        ("crid",      "crid_mod.exe"),
+        ("flac",      "flac.exe"),
+        ("maiforge",  "maiforge.exe"),
+        ("AssetStudio", "AssetStudio.CLI.exe"),
+    ]
+    parts = []
+    for label, tool in tool_checks:
+        found = autodetect_tool(tool) is not None
+        parts.append(f"{'✓' if found else '✗'} {label}")
+    print("Tools: " + "  ".join(parts))
+    print()
+
     return ask_choice("Enter choice: ", {"0", "1", "2", "3", "4", "5", "6"})
 
 
@@ -688,6 +811,242 @@ def scene_existing_assets_decision():
     return ask_choice("Enter choice: ", {"1", "2", "3"})
 
 
+def scene_detect_and_confirm_assets(mode_type: str, axxx_path, axxx_paths: list):
+    """Auto-detect temp assets in AXXX folder(s) and ask how to proceed.
+
+    Returns a dict with music_path, cover_path, video_path, auto_convert_assets,
+    auto_convert_targets, existing_assets_policy, and ignore_incomplete — or None
+    if the user cancels.
+    """
+    all_paths = list(axxx_paths) if axxx_paths else ([axxx_path] if axxx_path else [])
+    status = detect_axxx_temp_assets(all_paths)
+    n = status["n_folders"]
+    is_batch = n > 1
+
+    def _status_line(label, dir_name, folders_with, folders_partial, total_desc, source_count):
+        if is_batch:
+            if folders_with == n:
+                found_str = f"complete in all {n} folders"
+            elif folders_with > 0 and folders_partial > 0:
+                found_str = f"complete in {folders_with}/{n}, partial in {folders_partial}/{n}"
+            elif folders_with > 0:
+                found_str = f"complete in {folders_with}/{n} folders"
+            elif folders_partial > 0:
+                found_str = f"partial in {folders_partial}/{n} folders"
+            else:
+                found_str = "not found"
+        else:
+            if folders_with > 0:
+                found_str = total_desc
+            elif folders_partial > 0:
+                found_str = f"partial ({total_desc})"
+            else:
+                found_str = "not found"
+        if folders_with == n:
+            icon = "✓"
+        elif folders_with > 0 or folders_partial > 0:
+            icon = "~"
+        else:
+            icon = "✗"
+        src = f" (source available in {source_count}/{n})" if (folders_with + folders_partial) < n and source_count > 0 else ""
+        return f"  [{icon}] {label:<10} {dir_name:<16} {found_str}{src}"
+
+    music_line = _status_line(
+        "Music", "musicMP3/",
+        status["music_folders_with"],
+        status["music_folders_partial"],
+        f"{status['music_total']} MP3 file(s)",
+        status["music_source_count"],
+    )
+    cover_line = _status_line(
+        "Jackets", "Jackets/",
+        status["cover_folders_with"],
+        status["cover_folders_partial"],
+        "images found",
+        status["cover_source_count"],
+    )
+    video_line = _status_line(
+        "Video", "Movie/",
+        status["video_folders_with"],
+        status["video_folders_partial"],
+        f"{status['video_total']} MP4 file(s)",
+        status["video_source_count"],
+    )
+
+    music_complete = status["music_folders_with"] == n
+    cover_complete = status["cover_folders_with"] == n
+    video_complete = status["video_folders_with"] == n
+    music_partial = status["music_folders_partial"] > 0
+    cover_partial = status["cover_folders_partial"] > 0
+    video_partial = status["video_folders_partial"] > 0
+    all_complete = music_complete and cover_complete and video_complete
+    any_partial = music_partial or cover_partial or video_partial
+
+    # Which types need attention (missing entirely OR partial)
+    missing_types = []
+    if not music_complete:
+        missing_types.append("music")
+    if not cover_complete:
+        missing_types.append("cover")
+    if not video_complete:
+        missing_types.append("video")
+
+    can_generate = {
+        t for t in missing_types
+        if (t == "music" and status["music_source_count"] > 0)
+        or (t == "cover" and status["cover_source_count"] > 0)
+        or (t == "video" and status["video_source_count"] > 0)
+    }
+
+    batch_label = f"  Batch: {n} folders" if is_batch else "  Single"
+    clear_screen()
+    show_header()
+    print(f"Temp Asset Detection  ({batch_label.strip()})\n")
+    print("  " + "─" * 58)
+    print(music_line)
+    print(cover_line)
+    print(video_line)
+    print("  " + "─" * 58)
+
+    if all_complete:
+        print("\n  All temp assets detected.\n")
+        wait_enter()
+        if mode_type == "single" and axxx_path:
+            return {
+                "music_path": axxx_path / "musicMP3",
+                "cover_path": axxx_path / "Jackets",
+                "video_path": axxx_path / "Movie",
+                "auto_convert_assets": False,
+                "auto_convert_targets": [],
+                "existing_assets_policy": None,
+                "ignore_incomplete": False,
+            }
+        # Batch: let auto_build pick up each AXXX's own subdirs via skip policy
+        return {
+            "music_path": None,
+            "cover_path": None,
+            "video_path": None,
+            "auto_convert_assets": True,
+            "auto_convert_targets": ["music", "cover", "video"],
+            "existing_assets_policy": "skip",
+            "ignore_incomplete": False,
+        }
+
+    # Some assets are missing or partial
+    missing_count = len(missing_types)
+    partial_note = "  [~] = partial files from a previous interrupted run.\n" if any_partial else ""
+    print(f"\n  {missing_count} asset type(s) missing or incomplete.\n{partial_note}")
+
+    valid_choices = {"2", "3"}
+    if can_generate:
+        gen_names = {"music": "Music", "cover": "Jackets", "video": "Video"}
+        gen_list = ", ".join(gen_names[k] for k in missing_types if k in can_generate)
+        print(f"  [1] Generate missing ({gen_list}) and proceed")
+        valid_choices.add("1")
+    else:
+        print("  [1] (Cannot generate — source files not available)")
+
+    print("  [2] Proceed (ignore missing)")
+    print("  [3] Cancel")
+    print()
+
+    choice = ask_choice("Enter choice: ", valid_choices)
+
+    if choice == "3":
+        return None
+
+    if choice == "2":
+        # Use whatever is found (complete or partial); ignore the rest
+        if mode_type == "single" and axxx_path:
+            return {
+                "music_path": (axxx_path / "musicMP3") if (status["music_folders_with"] > 0 or status["music_folders_partial"] > 0) else None,
+                "cover_path": (axxx_path / "Jackets") if (status["cover_folders_with"] > 0 or status["cover_folders_partial"] > 0) else None,
+                "video_path": (axxx_path / "Movie") if (status["video_folders_with"] > 0 or status["video_folders_partial"] > 0) else None,
+                "auto_convert_assets": False,
+                "auto_convert_targets": [],
+                "existing_assets_policy": None,
+                "ignore_incomplete": True,
+            }
+        found_targets = []
+        if status["music_folders_with"] > 0 or status["music_folders_partial"] > 0:
+            found_targets.append("music")
+        if status["cover_folders_with"] > 0 or status["cover_folders_partial"] > 0:
+            found_targets.append("cover")
+        if status["video_folders_with"] > 0 or status["video_folders_partial"] > 0:
+            found_targets.append("video")
+        return {
+            "music_path": None,
+            "cover_path": None,
+            "video_path": None,
+            "auto_convert_assets": bool(found_targets),
+            "auto_convert_targets": found_targets,
+            "existing_assets_policy": "skip" if found_targets else None,
+            "ignore_incomplete": True,
+        }
+
+    # choice == "1": Let user pick which missing types to generate
+    generatable = [t for t in missing_types if t in can_generate]
+    gen_display = {"music": "Music  (source: SoundData/)", "cover": "Jackets (source: AssetBundleImages/)", "video": "Video  (source: MovieData/)"}
+
+    # Toggle selection — all generatable types start ON
+    selected = {t: True for t in generatable}
+
+    while True:
+        clear_screen()
+        show_header()
+        print("Generate Assets\n")
+        print("  Toggle which asset types to generate:\n")
+        for i, t in enumerate(generatable, start=1):
+            state = "ON " if selected[t] else "OFF"
+            print(f"  [{i}] [{state}]  {gen_display[t]}")
+        print()
+        print("  [C] Confirm and proceed")
+        print("  [X] Cancel")
+        print()
+
+        valid = {str(i) for i in range(1, len(generatable) + 1)} | {"c", "C", "x", "X"}
+        raw = input("Enter choice: ").strip()
+        if raw not in valid:
+            continue
+        if raw.lower() == "x":
+            return None
+        if raw.lower() == "c":
+            break
+        idx = int(raw) - 1
+        t = generatable[idx]
+        selected[t] = not selected[t]
+
+    targets_to_generate = [t for t in generatable if selected[t]]
+    # found_targets: types already complete — always pass through (with skip policy)
+    # But only include them if they weren't toggled off (they can't be, but be explicit)
+    found_targets = [t for t in ["music", "cover", "video"] if t not in missing_types]
+    all_targets = found_targets + targets_to_generate
+
+    if mode_type == "single" and axxx_path:
+        return {
+            # Only pass a pre-built path when the asset was already complete.
+            # If the type was missing (even if user toggled it off), pass None
+            # so the command builder omits the flag entirely.
+            "music_path": (axxx_path / "musicMP3") if "music" not in missing_types else None,
+            "cover_path": (axxx_path / "Jackets") if "cover" not in missing_types else None,
+            "video_path": (axxx_path / "Movie") if "video" not in missing_types else None,
+            "auto_convert_assets": bool(targets_to_generate),
+            "auto_convert_targets": targets_to_generate,
+            "existing_assets_policy": "skip",  # preserve any already-converted files
+            "ignore_incomplete": False,
+        }
+    # Batch: include both found (skip keeps them) and to-generate
+    return {
+        "music_path": None,
+        "cover_path": None,
+        "video_path": None,
+        "auto_convert_assets": bool(all_targets),
+        "auto_convert_targets": all_targets,
+        "existing_assets_policy": "skip",
+        "ignore_incomplete": False,
+    }
+
+
 def scene_existing_output_decision():
     clear_screen()
     show_header()
@@ -808,12 +1167,65 @@ def prompt_flac(single_or_batch):
     }
 
 
+_CHART_FORMAT_OPTIONS = [
+    ("zip_after", "Save as .zip"),
+    ("adx_after", "Save as .adx (AstroDX)"),
+]
+
+
+def ask_chart_format_interactive():
+    """Interactive checklist for chart output format options.
+    Returns dict with zip_after and adx_after, or None if cancelled.
+    """
+    options = _CHART_FORMAT_OPTIONS
+    toggles = [False] * len(options)
+    cursor = 0
+
+    if not WINDOWS or CLI_MODE:
+        return {
+            "zip_after": ask_yes_no("Save as .zip? (y/n): "),
+            "adx_after": ask_yes_no("Save as .adx (AstroDX)? (y/n): "),
+        }
+
+    while True:
+        clear_screen()
+        show_header()
+        print("Chart Output Format\n")
+        print("  Up/Down = move   Space = toggle   Enter = confirm   Esc = cancel\n")
+        for i, (_, label) in enumerate(options):
+            pointer = ">" if cursor == i else " "
+            mark = "\u25cf" if toggles[i] else " "
+            print(f"  {pointer} [{mark}] {label}")
+
+        key = msvcrt.getwch()
+        if key in ("\r", "\n"):
+            break
+        elif key == "\x1b":
+            return None
+        elif key == " ":
+            toggles[cursor] = not toggles[cursor]
+        elif key in ("\xe0", "\x00"):
+            key2 = msvcrt.getwch()
+            if key2 == "H":
+                cursor = (cursor - 1) % len(options)
+            elif key2 == "P":
+                cursor = (cursor + 1) % len(options)
+
+    return {key: toggles[i] for i, (key, _) in enumerate(options)}
+
+
 def prompt_chart():
     clear_screen()
     show_header()
 
     input_path = ask_existing_file("Enter path to your chart file (.ma2): ")
     output_path = ask_output_dir("Enter output folder: ")
+
+    fmt = ask_chart_format_interactive()
+    if fmt is None:
+        return None
+    zip_after = fmt["zip_after"]
+    adx_after = fmt["adx_after"]
 
     policy = resolve_existing_output_policy_if_needed(output_path, folder_mode=True)
     if policy is None:
@@ -822,6 +1234,8 @@ def prompt_chart():
     return {
         "input_path": input_path,
         "output_path": output_path,
+        "zip_after": zip_after,
+        "adx_after": adx_after,
         "mode_type": "single",
         "existing_output_policy": policy,
     }
@@ -850,10 +1264,132 @@ def prompt_image(single_or_batch):
     }
 
 
+_DB_CATEGORY_LABELS = [
+    "Genre", "Level", "Cabinet", "Composer", "BPM", "SD/DX Chart", "No subfolders"
+]
+
+_DB_TOGGLE_OPTIONS = [
+    ("decimal",           "Force decimal levels"),
+    ("use_number",        "Use music ID as folder name"),
+    ("json_log",          "Create JSON log"),
+    ("zip_after",         "Zip after conversion (per-category .zip)"),
+    ("adx_after",         "AstroDX export (per-category .adx)"),
+    ("adx_track",         "AstroDX export (per-track .adx)"),
+    ("collection",        "Generate collection manifest"),
+    ("ignore_incomplete", "Ignore errors (--ignore-incomplete)"),
+]
+
+
+def ask_db_options_interactive():
+    """Interactive checklist for database conversion options.
+    Returns dict of all options + output_path, or None if cancelled.
+    """
+    N_CATS = len(_DB_CATEGORY_LABELS)
+    N_TOGGLES = len(_DB_TOGGLE_OPTIONS)
+    TOTAL = N_CATS + N_TOGGLES
+
+    category_idx = 2  # default: Cabinet
+    toggles = [False] * N_TOGGLES
+    cursor = category_idx
+
+    if not WINDOWS or CLI_MODE:
+        # Non-interactive fallback
+        clear_screen()
+        show_header()
+        print("Database Conversion Options\n")
+        print("Categorization:")
+        for i, label in enumerate(_DB_CATEGORY_LABELS):
+            print(f"  {i} = {label}")
+        categorization = ask_choice("Enter categorization (0-6): ", {str(i) for i in range(N_CATS)})
+        decimal = ask_yes_no("Force decimal levels? (y/n): ")
+        use_number = ask_yes_no("Use music ID as folder name? (y/n): ")
+        json_log = ask_yes_no("Create JSON log? (y/n): ")
+        zip_after = ask_yes_no("Zip after conversion (.zip)? (y/n): ")
+        adx_after = ask_yes_no("AstroDX export (.adx)? (y/n): ")
+        adx_track = ask_yes_no("AstroDX export per-track (.adx)? (y/n): ")
+        collection = ask_yes_no("Generate collection manifest? (y/n): ")
+        ignore_incomplete = ask_yes_no("Ignore errors? (y/n): ")
+        output_path = ask_output_dir("  Output folder: ")
+        return {
+            "categorization": categorization,
+            "decimal": decimal,
+            "use_number": use_number,
+            "json_log": json_log,
+            "zip_after": zip_after,
+            "adx_after": adx_after,
+            "adx_track": adx_track,
+            "collection": collection,
+            "ignore_incomplete": ignore_incomplete,
+            "output_path": output_path,
+        }
+
+    while True:
+        clear_screen()
+        show_header()
+        print("Database Conversion Options\n")
+        print("  Up/Down = move   Space = select/toggle   Enter = confirm   Esc = cancel\n")
+
+        print("  Categorization:")
+        for i, label in enumerate(_DB_CATEGORY_LABELS):
+            pointer = ">" if cursor == i else " "
+            mark = "\u25cf" if category_idx == i else " "
+            print(f"  {pointer} ({mark}) {i}  {label}")
+
+        print()
+        print("  Options:")
+        for i, (_, label) in enumerate(_DB_TOGGLE_OPTIONS):
+            idx = N_CATS + i
+            pointer = ">" if cursor == idx else " "
+            mark = "\u25cf" if toggles[i] else " "
+            print(f"  {pointer} [{mark}] {label}")
+
+        key = msvcrt.getwch()
+
+        if key in ("\r", "\n"):
+            break
+        elif key == "\x1b":
+            return None
+        elif key == " ":
+            if cursor < N_CATS:
+                category_idx = cursor
+            else:
+                t = cursor - N_CATS
+                toggles[t] = not toggles[t]
+        elif key in ("\xe0", "\x00"):
+            key2 = msvcrt.getwch()
+            if key2 == "H":
+                cursor = (cursor - 1) % TOTAL
+            elif key2 == "P":
+                cursor = (cursor + 1) % TOTAL
+
+    # Show confirmed summary and ask output path inline
+    clear_screen()
+    show_header()
+    print("Database Conversion Options\n")
+    print(f"  Categorization : {category_idx}  {_DB_CATEGORY_LABELS[category_idx]}")
+    for i, (_, label) in enumerate(_DB_TOGGLE_OPTIONS):
+        mark = "\u25cf" if toggles[i] else "\u25cb"
+        print(f"  [{mark}] {label}")
+    print()
+    output_path = ask_output_dir("  Output folder: ")
+
+    return {
+        "categorization": str(category_idx),
+        "decimal": toggles[0],
+        "use_number": toggles[1],
+        "json_log": toggles[2],
+        "zip_after": toggles[3],
+        "adx_after": toggles[4],
+        "adx_track": toggles[5],
+        "collection": toggles[6],
+        "ignore_incomplete": toggles[7],
+        "output_path": output_path,
+    }
+
+
 def prompt_database():
     clear_screen()
     show_header()
-    print("Leave blank if not applied.\n")
 
     detection = ask_axxx_or_batch("(Required) Enter path to your AXXX folder or batch root: ")
     mode_type = detection["mode_type"]
@@ -861,109 +1397,47 @@ def prompt_database():
     axxx_paths = detection.get("axxx_paths") or []
 
     if mode_type == "single" and axxx_path:
-        print(f"Detected: Single database ({axxx_path.name})\n")
+        print(f"  Detected: Single database ({axxx_path.name})\n")
     elif mode_type == "batch":
-        print(f"Detected: Batch database with {len(axxx_paths)} folders: {format_axxx_list(axxx_paths)}")
-        print("Non-AXXX folders/files will be ignored.\n")
+        print(f"  Detected: Batch database  {len(axxx_paths)} folders: {format_axxx_list(axxx_paths)}")
+        print("  Non-AXXX folders/files will be ignored.\n")
 
-    music_path = ask_optional_existing_dir("Enter path to your music folder (mp3): ")
-    cover_path = ask_optional_existing_dir("Enter path to your cover/background folder (.png): ")
-    video_path = ask_optional_existing_dir("Enter path to your video folder (.mp4): ")
+    wait_enter()
 
-    auto_convert_assets = False
-    existing_assets_policy = None
+    # Auto-detect temp asset directories inside the AXXX folder(s)
+    asset_result = scene_detect_and_confirm_assets(mode_type, axxx_path, axxx_paths)
+    if asset_result is None:
+        return None
 
-    missing_count = sum([music_path is None, cover_path is None, video_path is None])
-    auto_convert_targets = []
+    music_path = asset_result["music_path"]
+    cover_path = asset_result["cover_path"]
+    video_path = asset_result["video_path"]
+    auto_convert_assets = asset_result["auto_convert_assets"]
+    auto_convert_targets = asset_result["auto_convert_targets"]
+    existing_assets_policy = asset_result["existing_assets_policy"]
+    ignore_incomplete = asset_result.get("ignore_incomplete", False)
 
-    if missing_count >= 2:
-        missing_items = []
-        if cover_path is None:
-            missing_items.append(("cover", "Assets (Jackets)"))
-        if video_path is None:
-            missing_items.append(("video", "MovieData"))
-        if music_path is None:
-            missing_items.append(("music", "MusicData (.awb -> .mp3)"))
+    opts = ask_db_options_interactive()
+    if opts is None:
+        return None
 
-        selected_targets = scene_select_missing_assets(missing_items)
-        if selected_targets is None:
-            return None
+    categorization = opts["categorization"]
+    decimal = opts["decimal"]
+    use_number = opts["use_number"]
+    json_log = opts["json_log"]
+    zip_after = opts["zip_after"]
+    adx_after = opts["adx_after"]
+    adx_track = opts["adx_track"]
+    collection = opts["collection"]
+    ignore_incomplete = opts["ignore_incomplete"]
+    output_path = opts["output_path"]
 
-        if selected_targets:
-            ignore_incomplete = False
-            auto_convert_assets = True
-            auto_convert_targets = selected_targets
-        else:
-            ignore_incomplete = ask_yes_no("No assets selected. Ignore any errors within the process? (y/n): ")
-    elif missing_count == 1:
-        # Exactly 1 missing: ask if they want to convert it
-        missing_items = []
-        if music_path is None:
-            missing_items.append(("music", "Music (MusicData)"))
-        if cover_path is None:
-            missing_items.append(("cover", "Assets (Jackets)"))
-        if video_path is None:
-            missing_items.append(("video", "MovieData"))
-
-        missing_key, missing_name = missing_items[0] if missing_items else ("unknown", "unknown")
-
-        convert_single = ask_yes_no(f"Auto-convert missing {missing_name}? (y/n): ")
-
-        if convert_single:
-            ignore_incomplete = False
-            auto_convert_assets = True
-            auto_convert_targets = [missing_key]
-        else:
-            ignore_incomplete = ask_yes_no("Ignore any errors within the process? (y/n): ")
+    # Check the actual AXXX-specific output dir, not just the parent folder
+    if mode_type == "batch":
+        _check_existing = any((output_path / p.name).exists() for p in axxx_paths)
     else:
-        # No missing assets
-        ignore_incomplete = ask_yes_no("Ignore any errors within the process? (y/n): ")
-
-    if auto_convert_assets:
-        selected_targets = set(auto_convert_targets or ["music", "cover", "video"])
-
-        if mode_type == "batch":
-            existing_music, existing_cover, existing_video = get_existing_auto_assets(axxx_paths, selected_targets)
-        else:
-            auto_music_dir = axxx_path / "musicMP3"
-            auto_cover_dir = axxx_path / "Jackets"
-            auto_video_dir = axxx_path / "Movie"
-            existing_music = count_existing_files_with_ext(auto_music_dir, ".mp3") if "music" in selected_targets else 0
-            existing_cover = output_folder_has_relevant_image_outputs(auto_cover_dir) if "cover" in selected_targets else False
-            existing_video = count_existing_files_with_ext(auto_video_dir, ".mp4") if "video" in selected_targets else 0
-
-        if existing_music > 0 or existing_cover or existing_video > 0:
-            choice = scene_existing_assets_decision()
-            if choice == "1":
-                existing_assets_policy = "overwrite"
-            elif choice == "2":
-                existing_assets_policy = "skip"
-            else:
-                return None
-        else:
-            existing_assets_policy = "overwrite"
-
-    clear_screen()
-    show_header()
-    print("Database Conversion Options\n")
-    print("Categorization:")
-    print("0 = Genre")
-    print("1 = Level")
-    print("2 = Cabinet")
-    print("3 = Composer")
-    print("4 = BPM")
-    print("5 = SD/DX Chart")
-    print("6 = No subfolders")
-    categorization = ask_choice("Enter categorization: ", {"0", "1", "2", "3", "4", "5", "6"})
-
-    decimal = ask_yes_no("Force decimal levels? (y/n): ")
-    use_number = ask_yes_no("Use musicID as folder name? (y/n): ")
-    json_log = ask_yes_no("Create JSON log? (y/n): ")
-    zip_after = ask_yes_no("Zip after conversion? (y/n): ")
-    collection = ask_yes_no("Generate collection manifest? (y/n): ")
-
-    output_path = ask_output_dir("Enter output folder: ")
-    if output_folder_has_relevant_database_outputs(output_path):
+        _check_existing = (output_path / axxx_path.name).exists()
+    if _check_existing:
         output_policy = resolve_existing_output_policy()
     else:
         output_policy = "overwrite"
@@ -971,7 +1445,6 @@ def prompt_database():
         return None
 
     return {
-        "mode_type": mode_type,
         "axxx_path": axxx_path,
         "axxx_paths": axxx_paths,
         "batch_root": detection.get("batch_root"),
@@ -988,6 +1461,8 @@ def prompt_database():
         "use_number": use_number,
         "json_log": json_log,
         "zip_after": zip_after,
+        "adx_after": adx_after,
+        "adx_track": adx_track,
         "collection": collection,
         "output_path": output_path,
         "auto_generated_temp_dirs": [],
@@ -997,36 +1472,100 @@ def prompt_database():
 # COMMAND BUILDERS
 # =========================================================
 
+def patch_music_xml_jacket_fields(axxx_path: Path, cover_path) -> list:
+    """Pre-patch empty <jacketFile> fields in Music.xml before running maiforge.
+    
+    Maiforge crashes with 'The path is empty. (Parameter path)' when <jacketFile>
+    is empty string. This fills it from cueName/id -> UI_Jacket_XXXXXX.png.
+    """
+    music_root = axxx_path / "music"
+    if not music_root.is_dir():
+        return []
+
+    # Build index: numeric cue_id -> jacket filename
+    jacket_index: dict[int, str] = {}
+    if cover_path and cover_path.is_dir():
+        for f in cover_path.glob("UI_Jacket_*.png"):
+            num_part = f.stem.replace("UI_Jacket_", "")
+            try:
+                jacket_index[int(num_part)] = f.name
+            except ValueError:
+                pass
+
+    patched = 0
+    logs = []
+    for music_dir in music_root.iterdir():
+        if not music_dir.is_dir():
+            continue
+        xml_path = music_dir / "Music.xml"
+        if not xml_path.exists():
+            continue
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            jf_el = root.find("jacketFile")
+            if jf_el is None:
+                continue
+            if jf_el.text and jf_el.text.strip():
+                continue  # already has a value
+
+            cue_id_text = root.findtext("cueName/id") or ""
+            try:
+                cue_id = int(cue_id_text)
+            except ValueError:
+                continue
+
+            jacket_name = jacket_index.get(cue_id)
+            if not jacket_name:
+                # fallback: zero-pad to 6 digits
+                jacket_name = f"UI_Jacket_{cue_id:06d}.png"
+
+            jf_el.text = jacket_name
+            ET.indent(tree, space="  ")
+            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+            patched += 1
+        except Exception:
+            pass
+
+    if patched:
+        logs.append(f"[OK] Patched jacketFile in {patched} Music.xml file(s)")
+    return logs
+
+
 def build_compile_database_command(payload, resolved_tools):
-    exe = resolved_tools["MaichartConverter.exe"]
+    exe = resolved_tools["maiforge.exe"]
 
     cmd = [
         str(exe),
-        "CompileDatabase",
-        "-p", str(payload["axxx_path"]),
-        "-o", str(payload["output_path"]),
-        "-g", str(payload["categorization"]),
+        "db-compile",
+        "--input", str(payload["axxx_path"]),
+        "--output", str(payload.get("maiforge_output_root") or payload["output_path"]),
+        "--category", str(payload["categorization"]),
     ]
 
     if payload["music_path"]:
-        cmd.extend(["-m", str(payload["music_path"])])
+        cmd.extend(["--music", str(payload["music_path"])])
     if payload["cover_path"]:
-        cmd.extend(["-c", str(payload["cover_path"])])
+        cmd.extend(["--cover", str(payload["cover_path"])])
     if payload["video_path"]:
-        cmd.extend(["-v", str(payload["video_path"])])
+        cmd.extend(["--video", str(payload["video_path"])])
 
     if payload["decimal"]:
-        cmd.append("-d")
+        cmd.append("--decimal")
     if payload["ignore_incomplete"]:
-        cmd.append("-i")
+        cmd.append("--ignore-incomplete")
     if payload["use_number"]:
-        cmd.append("-n")
+        cmd.append("--use-number")
     if payload["json_log"]:
-        cmd.append("-j")
+        cmd.append("--json")
     if payload["zip_after"]:
-        cmd.append("-z")
+        cmd.append("--zip")
+    if payload.get("adx_after"):
+        cmd.append("--adx")
+    if payload.get("adx_track"):
+        cmd.append("--adx-track")
     if payload["collection"]:
-        cmd.append("-k")
+        cmd.append("--collection")
 
     return cmd
 
@@ -1684,12 +2223,13 @@ def run_flac_shell(payload, display_mode, resolved_tools):
 # =========================================================
 
 def build_chart_conversion_command(chart_input: Path, output_path: Path, resolved_tools: dict):
-    exe = resolved_tools["MaichartConverter.exe"]
+    exe = resolved_tools["maiforge.exe"]
     return [
         str(exe),
-        "CompileMa2",
-        "-p", str(chart_input),
-        "-o", str(output_path),
+        "ma2-compile",
+        "--input", str(chart_input),
+        "--output", str(output_path),
+        "--format", "Simai",
     ]
 
 
@@ -1746,7 +2286,7 @@ def run_chart_shell(payload, display_mode, resolved_tools):
                 print("STDERR:")
                 print(stderr_text)
                 print()
-            wait_enter()
+            countdown_after_conversion(5, label="Continuing")
 
         log_lines = [
             "=" * 80,
@@ -1766,6 +2306,23 @@ def run_chart_shell(payload, display_mode, resolved_tools):
                 f.write(line + "\n")
 
         if result.returncode == 0:
+            if payload.get("zip_after"):
+                import zipfile as _zf
+                zip_dest = output_path.with_suffix(".zip")
+                with _zf.ZipFile(zip_dest, "w", _zf.ZIP_DEFLATED) as zf:
+                    for f in output_path.rglob("*"):
+                        zf.write(f, f.relative_to(output_path.parent))
+                import shutil as _sh
+                _sh.rmtree(output_path)
+            if payload.get("adx_after"):
+                import zipfile as _zf
+                adx_dest = output_path.with_suffix(".adx")
+                with _zf.ZipFile(adx_dest, "w", _zf.ZIP_DEFLATED) as zf:
+                    for f in output_path.rglob("*"):
+                        zf.write(f, f.relative_to(output_path.parent))
+                if not payload.get("zip_after"):  # only delete once
+                    import shutil as _sh
+                    _sh.rmtree(output_path)
             return 1, 0, 0, log_path
         return 0, 0, 1, log_path
 
@@ -1783,7 +2340,7 @@ def run_chart_shell(payload, display_mode, resolved_tools):
             print("EXCEPTION:")
             print(str(e))
             print()
-            wait_enter()
+            countdown_after_conversion(5, label="Continuing")
 
         return 0, 0, 1, log_path
 
@@ -1861,7 +2418,7 @@ def run_image_shell(payload, display_mode, resolved_tools):
                     print("STDERR:")
                     print(stderr_text)
                     print()
-                wait_enter()
+                countdown_after_conversion(5, label="Continuing")
 
             log_lines = [
                 "=" * 80,
@@ -1897,7 +2454,7 @@ def run_image_shell(payload, display_mode, resolved_tools):
                 print("EXCEPTION:")
                 print(str(e))
                 print()
-                wait_enter()
+                countdown_after_conversion(5, label="Continuing")
 
             return 0, 0, 1, log_path
 
@@ -1956,7 +2513,7 @@ def run_image_shell(payload, display_mode, resolved_tools):
                     print("STDERR:")
                     print(stderr_text)
                     print()
-                wait_enter()
+                countdown_after_conversion(5, label="Continuing")
 
             log_lines = [
                 "=" * 80,
@@ -1992,7 +2549,7 @@ def run_image_shell(payload, display_mode, resolved_tools):
                 print("EXCEPTION:")
                 print(str(e))
                 print()
-                wait_enter()
+                countdown_after_conversion(5, label="Continuing")
 
             return 0, 0, 1, log_path
 
@@ -2494,6 +3051,8 @@ def build_cli_parser():
     db_parser.add_argument("--use-number", action="store_true")
     db_parser.add_argument("--json-log", action="store_true")
     db_parser.add_argument("--zip-after", action="store_true")
+    db_parser.add_argument("--adx-after", action="store_true")
+    db_parser.add_argument("--adx-track", action="store_true")
     db_parser.add_argument("--collection", action="store_true")
 
      # =====================================================
@@ -2525,7 +3084,7 @@ def apply_cli_tool_overrides(args):
         "ffprobe.exe": args.tool_ffprobe,
         "flac.exe": args.tool_flac,
         "crid_mod.exe": args.tool_crid,
-        "MaichartConverter.exe": args.tool_maichartconverter,
+        "maiforge.exe": args.tool_maichartconverter,
         "AssetStudio.CLI.exe": args.tool_assetstudio,
     }
 
@@ -2612,6 +3171,8 @@ def build_database_payload_from_args(args):
         "use_number": args.use_number,
         "json_log": args.json_log,
         "zip_after": args.zip_after,
+        "adx_after": args.adx_after,
+        "adx_track": args.adx_track,
         "collection": args.collection,
         "output_path": output_path,
         "auto_generated_temp_dirs": [],
@@ -2635,6 +3196,16 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
     output_policy = payload.get("existing_output_policy", "overwrite")
     auto_temp_dirs = []
     stage_logs = []
+
+    # The actual output directory maiforge will create is always output_path/axxx_name.
+    # For batch items, output_path is already set to base_output/axxx_name, so
+    # maiforge_output_root is set and maiforge outputs there directly.
+    # For single mode, maiforge appends the AXXX name to output_path.
+    axxx_name = payload["axxx_path"].name
+    if payload.get("maiforge_output_root"):
+        actual_output_dir = payload["output_path"]  # batch: already axxx-specific
+    else:
+        actual_output_dir = payload["output_path"] / axxx_name  # single: maiforge appends name
 
     selected_targets = set()
     if payload.get("auto_convert_assets"):
@@ -2692,63 +3263,96 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
         stage_logs.append(f"[PROGRESS] {current_task} ({done_items}/{total_items})")
         render_progress(current_task)
 
-    if output_folder_has_relevant_database_outputs(payload["output_path"]):
+    if actual_output_dir.exists() and actual_output_dir.is_dir():
         if output_policy == "skip":
             payload["output_path"].mkdir(parents=True, exist_ok=True)
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write("=" * 80 + "\n")
                 f.write("[SKIPPED]\n")
-                f.write(f"OUTPUT DIR: {payload['output_path']}\n")
+                f.write(f"OUTPUT DIR: {actual_output_dir}\n")
                 f.write("DETAIL: Existing output folder kept.\n")
             return 0, 0, 0, log_path
         elif output_policy == "overwrite":
-            clear_folder_contents(payload["output_path"])
+            clear_folder_contents(actual_output_dir)
 
     if payload.get("auto_convert_assets"):
         axxx_root = payload["axxx_path"]
-        asset_policy = payload.get("existing_assets_policy", "overwrite")
+        asset_policy = payload.get("existing_assets_policy", "skip")
 
         if payload["music_path"] is None and "music" in selected_targets:
-            music_path, s, m, f, logs = auto_build_music_assets(
-                axxx_root,
-                resolved_tools,
-                display_mode,
-                asset_policy,
-                progress_callback=progress_step,
-            )
-            payload["music_path"] = music_path
-            prep_missing += m
-            prep_failed += f
-            prep_logs.extend(logs)
-            auto_temp_dirs.append(music_path)
+            _existing_music = axxx_root / "musicMP3"
+            _source_awb = list((axxx_root / "SoundData").glob("*.awb")) if (axxx_root / "SoundData").is_dir() else []
+            _existing_mp3 = list(_existing_music.glob("*.mp3")) if _existing_music.is_dir() else []
+            _music_complete = bool(_existing_mp3) and (not _source_awb or len(_existing_mp3) >= len(_source_awb))
+            _music_preexisted = _existing_music.is_dir()
+            if _music_complete:
+                payload["music_path"] = _existing_music
+                prep_logs.append(f"[SKIP] musicMP3/ already complete in {axxx_root.name} ({len(_existing_mp3)} files) — skipping generation.")
+            else:
+                if _existing_mp3:
+                    prep_logs.append(f"[REGEN] musicMP3/ incomplete in {axxx_root.name} ({len(_existing_mp3)}/{len(_source_awb)}) — regenerating.")
+                music_path, s, m, f, logs = auto_build_music_assets(
+                    axxx_root,
+                    resolved_tools,
+                    display_mode,
+                    asset_policy,
+                    progress_callback=progress_step,
+                )
+                payload["music_path"] = music_path
+                prep_missing += m
+                prep_failed += f
+                prep_logs.extend(logs)
+                # Never auto-delete musicMP3 — it lives inside the AXXX source folder
 
         if payload["video_path"] is None and "video" in selected_targets:
-            video_path, s, m, f, logs = auto_build_video_assets(
-                axxx_root,
-                resolved_tools,
-                display_mode,
-                asset_policy,
-                progress_callback=progress_step,
-            )
-            payload["video_path"] = video_path
-            prep_missing += m
-            prep_failed += f
-            prep_logs.extend(logs)
-            auto_temp_dirs.append(video_path)
+            _existing_video = axxx_root / "Movie"
+            _source_dat = list((axxx_root / "MovieData").glob("*.dat")) if (axxx_root / "MovieData").is_dir() else []
+            _existing_mp4 = list(_existing_video.glob("*.mp4")) if _existing_video.is_dir() else []
+            _video_complete = bool(_existing_mp4) and (not _source_dat or len(_existing_mp4) >= len(_source_dat))
+            _video_preexisted = _existing_video.is_dir()
+            if _video_complete:
+                payload["video_path"] = _existing_video
+                prep_logs.append(f"[SKIP] Movie/ already complete in {axxx_root.name} ({len(_existing_mp4)} files) — skipping generation.")
+            else:
+                if _existing_mp4:
+                    prep_logs.append(f"[REGEN] Movie/ incomplete in {axxx_root.name} ({len(_existing_mp4)}/{len(_source_dat)}) — regenerating.")
+                video_path, s, m, f, logs = auto_build_video_assets(
+                    axxx_root,
+                    resolved_tools,
+                    display_mode,
+                    asset_policy,
+                    progress_callback=progress_step,
+                )
+                payload["video_path"] = video_path
+                prep_missing += m
+                prep_failed += f
+                prep_logs.extend(logs)
+                # Never auto-delete Movie — it lives inside the AXXX source folder
 
         if payload["cover_path"] is None and "cover" in selected_targets:
-            cover_path, s, m, f, logs = auto_build_cover_assets(
-                axxx_root,
-                resolved_tools,
-                display_mode,
-                asset_policy,
-                progress_callback=progress_step,
-            )
-            payload["cover_path"] = cover_path
-            prep_missing += m
-            prep_failed += f
-            prep_logs.extend(logs)
-            auto_temp_dirs.append(cover_path)
+            _existing_cover = axxx_root / "Jackets"
+            _source_ab = list((axxx_root / "AssetBundleImages" / "jacket").glob("*.ab")) if (axxx_root / "AssetBundleImages" / "jacket").is_dir() else []
+            _existing_png = list(_existing_cover.glob("*.png")) if _existing_cover.is_dir() else []
+            _cover_complete = bool(_existing_png) and (not _source_ab or len(_existing_png) >= len(_source_ab))
+            _cover_preexisted = _existing_cover.is_dir()
+            if _cover_complete:
+                payload["cover_path"] = _existing_cover
+                prep_logs.append(f"[SKIP] Jackets/ already complete in {axxx_root.name} ({len(_existing_png)} files) — skipping generation.")
+            else:
+                if _existing_png:
+                    prep_logs.append(f"[REGEN] Jackets/ incomplete in {axxx_root.name} ({len(_existing_png)}/{len(_source_ab)}) — regenerating.")
+                cover_path, s, m, f, logs = auto_build_cover_assets(
+                    axxx_root,
+                    resolved_tools,
+                    display_mode,
+                    asset_policy,
+                    progress_callback=progress_step,
+                )
+                payload["cover_path"] = cover_path
+                prep_missing += m
+                prep_failed += f
+                prep_logs.extend(logs)
+                # Never auto-delete Jackets — it lives inside the AXXX source folder
 
     payload["auto_generated_temp_dirs"] = auto_temp_dirs
 
@@ -2768,33 +3372,8 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
             required_ready = False
             required_fail_reasons.append("Video folder is not ready.")
 
-        if prep_missing > 0 or prep_failed > 0:
-            required_ready = False
-            if prep_missing > 0:
-                required_fail_reasons.append(f"Auto-build missing count: {prep_missing}")
-            if prep_failed > 0:
-                required_fail_reasons.append(f"Auto-build failed count: {prep_failed}")
-
     if not required_ready:
         payload["output_path"].mkdir(parents=True, exist_ok=True)
-        with open(log_path, "w", encoding="utf-8") as f:
-            if stage_logs:
-                f.write("DATABASE PROGRESS\n")
-                f.write("=" * 80 + "\n")
-                for line in stage_logs:
-                    f.write(line + "\n")
-                f.write("\n")
-            if prep_logs:
-                f.write("AUTO-CONVERT PREP LOGS\n")
-                f.write("=" * 80 + "\n")
-                for line in prep_logs:
-                    f.write(line + "\n")
-                f.write("\n")
-            f.write("DATABASE CONVERSION BLOCKED\n")
-            f.write("=" * 80 + "\n")
-            for reason in required_fail_reasons:
-                f.write(reason + "\n")
-
         with open(log_path, "w", encoding="utf-8") as f:
             if stage_logs:
                 f.write("DATABASE PROGRESS\n")
@@ -2822,21 +3401,75 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
 
         return 0, prep_missing, prep_failed + 1, log_path
 
+    # Pre-patch empty <jacketFile> fields in Music.xml before running maiforge.
+    # Maiforge crashes with "The path is empty" when jacketFile is "".
+    jacket_patch_logs = patch_music_xml_jacket_fields(
+        Path(payload["axxx_path"]),
+        Path(payload["cover_path"]) if payload.get("cover_path") else None,
+    )
+    for log_line in jacket_patch_logs:
+        print(log_line)
+
     progress_tick("Converting ma2 files & creating folders...")
     cmd = build_compile_database_command(payload, resolved_tools)
+    cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in cmd)
 
     if display_mode == "2":
         print("Running command:\n")
-        print(" ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in cmd))
+        print(cmd_str)
         print()
+        print("(streaming output — please wait...)\n")
+
+    stdout_lines = []
+    stderr_lines = []
+    returncode = -1
 
     try:
-        result = run_subprocess_safe(cmd, cwd=SCRIPT_ROOT)
-        stdout_text = result.stdout.strip() if result.stdout else ""
-        stderr_text = result.stderr.strip() if result.stderr else ""
+        enc = locale.getpreferredencoding(False)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(SCRIPT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding=enc,
+            errors="replace",
+        )
+
+        def _drain(pipe, bucket, live_print):
+            try:
+                for line in pipe:
+                    line = line.rstrip("\n\r")
+                    bucket.append(line)
+                    if live_print:
+                        print(line, flush=True)
+            except (ValueError, OSError):
+                pass  # pipe closed from another thread
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, display_mode == "2"), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, display_mode == "2"), daemon=True)
+        t_out.start()
+        t_err.start()
+        proc.wait()
+        # Close pipes explicitly so drain threads see EOF even if child
+        # processes inherited the handles and haven't exited yet (Windows).
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+        t_out.join(timeout=15)
+        t_err.join(timeout=15)
+        returncode = proc.returncode
+
+        stdout_text = "\n".join(stdout_lines).strip()
+        stderr_text = "\n".join(stderr_lines).strip()
 
         progress_step("Converting ma2 files & creating folders...")
-        if result.returncode == 0 and done_items < total_items:
+        if returncode == 0 and done_items < total_items:
             done_items = total_items
 
         payload["output_path"].mkdir(parents=True, exist_ok=True)
@@ -2856,7 +3489,7 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
 
             f.write("COMPILEDATABASE COMMAND\n")
             f.write("=" * 80 + "\n")
-            f.write(" ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in cmd) + "\n\n")
+            f.write(cmd_str + "\n\n")
             f.write("STDOUT:\n")
             f.write(stdout_text if stdout_text else "(empty)")
             f.write("\n\nSTDERR:\n")
@@ -2864,17 +3497,10 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
             f.write("\n")
 
         if display_mode == "2":
-            if stdout_text:
-                print("STDOUT:\n")
-                print(stdout_text)
-                print()
-            if stderr_text:
-                print("STDERR:\n")
-                print(stderr_text)
-                print()
-            wait_enter("Database conversion finished. Press Enter...")
+            print()
+            countdown_after_conversion(5, label="Returning to next step")
 
-        if result.returncode == 0:
+        if returncode == 0:
             return 1, prep_missing, prep_failed, log_path
 
         return 0, prep_missing, prep_failed + 1, log_path
@@ -2950,6 +3576,7 @@ def run_database_shell(payload, display_mode, resolved_tools):
         item_payload["mode_type"] = "single"
         item_payload["axxx_path"] = axxx_path
         item_payload["output_path"] = base_output / axxx_path.name
+        item_payload["maiforge_output_root"] = base_output
         item_payload["auto_generated_temp_dirs"] = []
         item_payload["mode_label"] = f"{axxx_path.name} {idx}/{len(axxx_paths)}"
 
@@ -2960,11 +3587,9 @@ def run_database_shell(payload, display_mode, resolved_tools):
         register_temp_dirs(item_payload.get("auto_generated_temp_dirs"))
         log_lines.append(f"[{axxx_path.name}] success={success} missing={missing} failed={failed} log={log_path}")
         if failed > 0 and not CLI_MODE:
-            if not ask_yes_no("There's an error in the process shit. Continue? (y/n): "):
+            if not ask_yes_no("An error occurred. Continue with remaining folders? (y/n): "):
                 log_lines.append("[ABORTED] User stopped batch after error.")
                 break
-        if idx < len(axxx_paths):
-            countdown_between_batches(10, completed_label=axxx_path.name)
 
     cleanup_lines = []
     cleanup_database_temp_dirs(all_temp_dirs, cleanup_lines)
@@ -3133,6 +3758,14 @@ def main():
         sys.exit(exit_code)
 
     CLI_MODE = False
+
+    # First-run nudge (non-blocking)
+    try:
+        from setup import nudge_if_needed
+        nudge_if_needed()
+    except Exception:
+        pass
+
     countdown_with_skip(10)
 
     while True:

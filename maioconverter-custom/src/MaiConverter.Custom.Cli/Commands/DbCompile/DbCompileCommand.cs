@@ -38,6 +38,8 @@ public sealed class DbCompileCommand : ICommand
                 parsed.HasFlag("json"),
                 parsed.HasFlag("zip"),
                 parsed.HasFlag("zip-track"),
+                parsed.HasFlag("adx"),
+                parsed.HasFlag("adx-track"),
                 parsed.HasFlag("collection"),
                 parsed.GetValue("music"),
                 parsed.GetValue("cover"),
@@ -82,6 +84,8 @@ public sealed class DbCompileCommand : ICommand
         Console.WriteLine("  --json                        (alias: -j)");
         Console.WriteLine("  --zip                         (per-category zip; deletes folders)");
         Console.WriteLine("  --zip-track                   (alias: -z; per-track zip)");
+        Console.WriteLine("  --adx                         (per-category .adx; same as zip, AstroDX format)");
+        Console.WriteLine("  --adx-track                   (per-track .adx)");
         Console.WriteLine("  --collection                  (alias: -k)");
     }
 
@@ -102,6 +106,8 @@ public sealed class DbCompileCommand : ICommand
             new OptionSpec("json", false, "j", "json"),
             new OptionSpec("zip", false, "zip"),
             new OptionSpec("zip-track", false, "z", "zip-track"),
+            new OptionSpec("adx", false, "adx"),
+            new OptionSpec("adx-track", false, "adx-track"),
             new OptionSpec("collection", false, "k", "collection"),
         ];
     }
@@ -162,30 +168,26 @@ public sealed class DbCompileCommand : ICommand
             var dxSuffix = info.IsDXChart ? "-DX" : string.Empty;
             var trackFolderName = $"{baseName}{dxSuffix}";
 
-            var targetPath = Path.Combine(categoryDir.FullName, trackFolderName);
+            var hasUtage = info.InformationDict.TryGetValue("Utage", out var utageValue) &&
+                           !string.IsNullOrWhiteSpace(utageValue);
+            var finalFolderName = hasUtage ? $"{trackFolderName}-Utage" : trackFolderName;
+            var targetPath = Path.Combine(categoryDir.FullName, finalFolderName);
             var targetDir = new DirectoryInfo(targetPath);
             if (!targetDir.Exists)
             {
                 targetDir.Create();
             }
 
-            var hasUtage = info.InformationDict.TryGetValue("Utage", out var utageValue) &&
-                           !string.IsNullOrWhiteSpace(utageValue);
-            if (hasUtage)
-            {
-                targetDir = new DirectoryInfo(targetPath + "-Utage");
-                if (!targetDir.Exists)
-                {
-                    targetDir.Create();
-                }
-            }
-
-            var compiler = new SimaiCompiler(options.StrictDecimal, trackFolder.FullName + Path.DirectorySeparatorChar,
-                targetDir.FullName, hasUtage);
+            var compiler = hasUtage
+                ? new SimaiCompiler(options.StrictDecimal, trackFolder.FullName + Path.DirectorySeparatorChar,
+                    targetDir.FullName, true)
+                : new SimaiCompiler(options.StrictDecimal, trackFolder.FullName + Path.DirectorySeparatorChar,
+                    targetDir.FullName);
             var maidata = MaidataCustomizer.ApplyBranding(compiler.Result, BrandingInfo.Default);
             File.WriteAllText(Path.Combine(targetDir.FullName, "maidata.txt"), maidata);
 
             var incomplete = false;
+            var bgPngMissing = false;
             var missingAssets = new List<string>();
             if (!string.IsNullOrWhiteSpace(options.MusicRoot))
             {
@@ -211,6 +213,7 @@ public sealed class DbCompileCommand : ICommand
                 {
                     warnings.Add($"Image not found: {info.TrackName} at {imageSource}");
                     incomplete = true;
+                    bgPngMissing = true;
                     missingAssets.Add("cover");
                 }
                 else if (!File.Exists(imageTarget))
@@ -235,23 +238,24 @@ public sealed class DbCompileCommand : ICommand
                 }
             }
 
-            if (incomplete)
+            // Mark _Incomplete when: bg.png is missing OR (ignore-incomplete is on AND any asset is missing)
+            if (incomplete && (bgPngMissing || options.IgnoreIncomplete))
             {
-                if (!options.IgnoreIncomplete)
-                {
-                    var shouldContinue = PromptContinueMissing(info.TrackName, missingAssets);
-                    if (!shouldContinue)
-                    {
-                        throw new FileNotFoundException("Conversion cancelled due to missing assets.");
-                    }
-                }
-
                 var incompleteDir = new DirectoryInfo(targetDir.FullName + "_Incomplete");
                 if (targetDir.Exists)
                 {
                     targetDir.MoveTo(incompleteDir.FullName);
                 }
                 continue;
+            }
+
+            if (incomplete && !options.IgnoreIncomplete)
+            {
+                var shouldContinue = PromptContinueMissing(info.TrackName, missingAssets);
+                if (!shouldContinue)
+                {
+                    throw new FileNotFoundException("Conversion cancelled due to missing assets.");
+                }
             }
 
             if (int.TryParse(info.TrackID, out var trackId))
@@ -263,6 +267,11 @@ public sealed class DbCompileCommand : ICommand
             if (options.ZipTrack)
             {
                 ZipService.ZipFolderAndMaybeDelete(targetDir, true);
+            }
+
+            if (options.AdxTrack)
+            {
+                ZipService.ZipFolderAndMaybeDelete(targetDir, true, extension: ".adx");
             }
         }
 
@@ -288,6 +297,19 @@ public sealed class DbCompileCommand : ICommand
                 }
 
                 ZipService.ZipFolderAndMaybeDelete(dir, true);
+            }
+        }
+
+        if (options.AdxCategory)
+        {
+            foreach (var dir in outputRoot.EnumerateDirectories())
+            {
+                if (dir.Name.Equals("collections", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                ZipService.ZipFolderAndMaybeDelete(dir, true, extension: ".adx");
             }
         }
     }
@@ -423,6 +445,8 @@ public sealed class DbCompileCommand : ICommand
         bool JsonLog,
         bool ZipCategory,
         bool ZipTrack,
+        bool AdxCategory,
+        bool AdxTrack,
         bool Collection,
         string? MusicRoot,
         string? CoverRoot,
