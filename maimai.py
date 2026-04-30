@@ -62,41 +62,48 @@ from tools.tools import (
 APP_TITLE = "Maimai's AIO Conversion"
 APP_SUBTITLE = "Created by Ryuki (Thanks CGPT also <3)"
 
-SCRIPT_ROOT = Path(__file__).resolve().parent
+if getattr(sys, 'frozen', False):
+    # Running as a PyInstaller bundle:
+    # - tools are extracted to _MEIPASS (temp dir, read-only)
+    # - config/settings live next to the .exe so they persist between runs
+    TOOLS_ROOT  = Path(sys._MEIPASS)
+    SCRIPT_ROOT = Path(sys.executable).parent
+else:
+    TOOLS_ROOT = SCRIPT_ROOT = Path(__file__).resolve().parent
+
 SUBSCRIPTS_DIR = SCRIPT_ROOT / "subscripts"
 
 TOOL_CANDIDATES = {
     "vgmstream-cli.exe": [
-        SCRIPT_ROOT / "vgmstream-win64" / "vgmstream-cli.exe",
-        SCRIPT_ROOT / "vgmstream-cli.exe",
+        TOOLS_ROOT / "vgmstream-win64" / "vgmstream-cli.exe",
+        TOOLS_ROOT / "vgmstream-cli.exe",
     ],
     "crid_mod.exe": [
-        SCRIPT_ROOT / "crid" / "crid_mod.exe",
-        SCRIPT_ROOT / "crid" / "crid.exe",
-        SCRIPT_ROOT / "crid_mod.exe",
-        SCRIPT_ROOT / "crid.exe",
+        TOOLS_ROOT / "crid" / "crid_mod.exe",
+        TOOLS_ROOT / "crid" / "crid.exe",
+        TOOLS_ROOT / "crid_mod.exe",
+        TOOLS_ROOT / "crid.exe",
     ],
     "ffmpeg.exe": [
-        SCRIPT_ROOT / "ffmpeg" / "ffmpeg.exe",
-        SCRIPT_ROOT / "ffmpeg.exe",
+        TOOLS_ROOT / "ffmpeg" / "ffmpeg.exe",
+        TOOLS_ROOT / "ffmpeg.exe",
     ],
     "ffprobe.exe": [
-        SCRIPT_ROOT / "ffmpeg" / "ffprobe.exe",
-        SCRIPT_ROOT / "ffprobe.exe",
+        TOOLS_ROOT / "ffmpeg" / "ffprobe.exe",
+        TOOLS_ROOT / "ffprobe.exe",
     ],
     "flac.exe": [
-        SCRIPT_ROOT / "flac" / "flac.exe",
-        SCRIPT_ROOT / "flac.exe",
+        TOOLS_ROOT / "flac" / "flac.exe",
+        TOOLS_ROOT / "flac.exe",
     ],
     "maiforge.exe": [
-        SCRIPT_ROOT / "maioconverter-custom" / "dist" / "win-x64" / "maiforge.exe",
-        SCRIPT_ROOT / "maiforge" / "maiforge.exe",
-        SCRIPT_ROOT / "maiforge.exe",
+        TOOLS_ROOT / "maioconverter-custom" / "dist" / "win-x64" / "maiforge.exe",
+        TOOLS_ROOT / "maiforge" / "maiforge.exe",
+        TOOLS_ROOT / "maiforge.exe",
     ],
     "AssetStudio.CLI.exe": [
-        SCRIPT_ROOT / "assetstudiocli" / "AssetStudio.CLI.exe",
-        SCRIPT_ROOT / "AssetStudio.CLI.exe",
-        Path(r"C:\Users\Jen\Downloads\Maimai\MAS\assetstudiocli\AssetStudio.CLI.exe"),
+        TOOLS_ROOT / "assetstudiocli" / "AssetStudio.CLI.exe",
+        TOOLS_ROOT / "AssetStudio.CLI.exe",
     ],
 }
 
