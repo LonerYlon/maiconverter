@@ -270,6 +270,144 @@ def _run_with_spinner(fn, message="Working"):
 
 
 # =========================================================
+# PROGRESS / NOTIFY HELPERS
+# =========================================================
+
+def _fmt_duration(secs: float) -> str:
+    secs = max(0, int(secs))
+    m, s = divmod(secs, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _print_progress(idx: int, total: int, label: str, start_time: float):
+    """Overwrite the current line with a progress bar + ETA. Call per file in mode '1'."""
+    elapsed = time.time() - start_time
+    if idx > 1 and elapsed > 0:
+        avg = elapsed / (idx - 1)
+        eta_str = _fmt_duration(avg * (total - idx + 1))
+    else:
+        eta_str = "--:--"
+    bar_done = int(20 * idx / total) if total else 0
+    bar = "\u2588" * bar_done + "\u2591" * (20 - bar_done)
+    short = label if len(label) <= 35 else "..." + label[-32:]
+    sys.stdout.write(
+        f"\r[{idx:{len(str(total))}}/{total}] {bar} {short:<35} | "
+        f"{_fmt_duration(elapsed)} elapsed | ETA {eta_str}   "
+    )
+    sys.stdout.flush()
+
+
+def _end_progress(total: int):
+    """Print a final newline to end the progress bar."""
+    sys.stdout.write(f"\r{'All done':<80}\n")
+    sys.stdout.flush()
+
+
+def _ask_with_hint(prompt: str, hint: str = "") -> str:
+    """
+    Input line that fills `hint` when the user presses Tab or → (right arrow).
+    Falls back to plain input() on non-Windows or when there is no hint.
+    """
+    if not WINDOWS or not hint:
+        full_prompt = f"{prompt}[→/Tab: {hint}] " if hint else prompt
+        return input(full_prompt).strip().strip('"')
+    import msvcrt as _msvcrt
+    hint_note = f" [→ or Tab fills last: {hint}]"
+    sys.stdout.write(prompt + hint_note + "\n> ")
+    sys.stdout.flush()
+    buf: list = []
+    while True:
+        ch = _msvcrt.getwch()
+        if ch in ('\r', '\n'):
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+            result = ''.join(buf).strip().strip('"')
+            return result if result else hint
+        elif ch == '\b':
+            if buf:
+                buf.pop()
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+        elif ch in ('\t', '\xe0', '\x00'):
+            if ch in ('\xe0', '\x00'):
+                ch2 = _msvcrt.getwch()
+                if ch2 != 'M':
+                    continue
+            # fill hint
+            sys.stdout.write('\b \b' * len(buf))
+            sys.stdout.write(hint)
+            sys.stdout.flush()
+            buf = list(hint)
+        elif ch == '\x03':
+            raise KeyboardInterrupt
+        elif ord(ch) >= 32:
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+
+def _notify_done(title: str = "maiconv", message: str = "Conversion complete!"):
+    """Beep and show a Windows balloon-tip notification (best-effort)."""
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONINFORMATION)
+    except Exception:
+        pass
+    try:
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$n = New-Object System.Windows.Forms.NotifyIcon; "
+            "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+            "$n.Visible = $true; "
+            f"$n.ShowBalloonTip(4000,'{title}','{message}',"
+            "[System.Windows.Forms.ToolTipIcon]::Info); "
+            "Start-Sleep -Milliseconds 4500; $n.Dispose()"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000 if WINDOWS else 0,
+        )
+    except Exception:
+        pass
+
+
+def _open_in_explorer(path: Path):
+    """Open a folder in Windows Explorer."""
+    try:
+        subprocess.Popen(["explorer", str(path)])
+    except Exception:
+        pass
+
+
+def _write_summary_log(log_path: Path, success: int, missing: int, failed: int,
+                        elapsed: float, start_ts: float) -> Path:
+    """Write a *_summary.txt alongside the main log."""
+    import datetime
+    summary_path = log_path.with_name(log_path.stem + "_summary.txt")
+    started = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 60,
+        "CONVERSION SUMMARY",
+        "=" * 60,
+        f"Started   : {started}",
+        f"Duration  : {_fmt_duration(elapsed)} ({elapsed:.1f}s)",
+        "-" * 60,
+        f"Success   : {success}",
+        f"Missing   : {missing}",
+        f"Failed    : {failed}",
+        f"Total     : {success + missing + failed}",
+        "=" * 60,
+    ]
+    try:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+    return summary_path
+
+
+# =========================================================
 # BASIC HELPERS
 # =========================================================
 
@@ -814,6 +952,10 @@ def scene_settings():
         static_label = {"loop": "Loop/stretch to audio length", "skip": "Skip (don't convert)"}.get(static_mode, static_mode)
         temp_cleanup = s.get("temp_cleanup", "auto")
         temp_cleanup_label = {"auto": "Delete after each file", "keep": "Keep all temp files", "batch": "Delete after full run"}.get(temp_cleanup, temp_cleanup)
+        retry_count   = s.get("retry_count", 1)
+        workers       = s.get("parallel_workers", 1)
+        notify        = s.get("notify_on_complete", True)
+        notify_label  = "On" if notify else "Off"
 
         clear_screen()
         show_header()
@@ -824,11 +966,14 @@ def scene_settings():
         print(f"  [4] Video encoder         : {enc_label}")
         print(f"  [5] Static video behavior : {static_label}")
         print(f"  [6] Temp file cleanup     : {temp_cleanup_label}")
+        print(f"  [7] Retry attempts        : {retry_count}x per file")
+        print(f"  [8] Parallel workers      : {workers}")
+        print(f"  [9] Notify on complete    : {notify_label}")
         print()
         print("  [C] Clear last output folder")
         print("  [0] Back")
         print()
-        choice = ask_choice("Enter choice: ", {"0", "1", "2", "3", "4", "5", "6", "c", "C"})
+        choice = ask_choice("Enter choice: ", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "c", "C"})
 
         if choice == "0":
             return
@@ -916,6 +1061,45 @@ def scene_settings():
             input("  Press Enter...")
         elif choice.lower() == "c":
             update_setting("last_output_dir", "")
+        elif choice == "7":
+            clear_screen()
+            show_header()
+            print("Settings — Retry Attempts\n")
+            print("  How many times to attempt a file before marking it failed.\n")
+            print(f"  [1] 1× (no retry)   {'*' if retry_count == 1 else ''}")
+            print(f"  [2] 2× (retry once) {'*' if retry_count == 2 else ''}")
+            print(f"  [3] 3× (retry twice){'*' if retry_count == 3 else ''}")
+            print()
+            c7 = ask_choice("Enter choice: ", {"1", "2", "3"})
+            update_setting("retry_count", int(c7))
+            print(f"\n  \u2713 Retry attempts set to {c7}×.")
+            input("  Press Enter...")
+        elif choice == "8":
+            clear_screen()
+            show_header()
+            print("Settings — Parallel Workers\n")
+            print("  How many files to process simultaneously.")
+            print("  (Note: MP4/crid conversions are always sequential.)\n")
+            for n in range(1, 5):
+                marker = " *" if workers == n else ""
+                print(f"  [{n}] {n} worker{'s' if n > 1 else ''}{marker}")
+            print()
+            c8 = ask_choice("Enter choice: ", {"1", "2", "3", "4"})
+            update_setting("parallel_workers", int(c8))
+            print(f"\n  \u2713 Parallel workers set to {c8}.")
+            input("  Press Enter...")
+        elif choice == "9":
+            clear_screen()
+            show_header()
+            print("Settings — Notify on Complete\n")
+            print("  Play a sound and show a Windows notification when a batch finishes.\n")
+            print(f"  [1] On  {'*' if notify else ''}")
+            print(f"  [2] Off {'*' if not notify else ''}")
+            print()
+            c9 = ask_choice("Enter choice: ", {"1", "2"})
+            update_setting("notify_on_complete", c9 == "1")
+            print(f"\n  \u2713 Notify on complete set to {'On' if c9 == '1' else 'Off'}.")
+            input("  Press Enter...")
 
 
 def scene_blank_assets_decision():
@@ -1288,17 +1472,34 @@ def resolve_existing_output_policy_if_needed(folder: Path, exts=None, folder_mod
     return resolve_existing_output_policy()
 
 
-def scene_completion(success_count, missing_count, failed_count, log_path=None):
+def scene_completion(success_count, missing_count, failed_count, log_path=None,
+                     output_path=None, elapsed=None):
+    if load_settings().get("notify_on_complete", True):
+        msg = f"Done — {success_count} ok"
+        if failed_count:
+            msg += f", {failed_count} failed"
+        _notify_done(message=msg)
+
     clear_screen()
     show_header()
     print("Conversion Completed!\n")
     print(f"Successfully Converted: {success_count}")
     print(f"Missing: {missing_count}")
     print(f"Failed: {failed_count}")
+    if elapsed is not None:
+        print(f"Time taken: {_fmt_duration(elapsed)} ({elapsed:.1f}s)")
     print()
     if log_path:
         print(f"Logs are stored at:\n{log_path}")
-    wait_enter("Press Enter to return to main menu...")
+    if output_path:
+        print(f"\n[O] Open output folder in Explorer")
+    print()
+    prompt = "Press Enter to return to main menu"
+    if output_path:
+        prompt += ", or type O to open output"
+    val = input(prompt + ": ").strip().lower()
+    if val == "o" and output_path:
+        _open_in_explorer(output_path)
 
 # =========================================================
 # PROMPTS
@@ -1308,10 +1509,24 @@ def prompt_mp4(single_or_batch):
     clear_screen()
     show_header()
 
+    s = load_settings()
+    last_in = s.get("last_mp4_input", "")
+
     if single_or_batch == "1":
-        input_path = ask_existing_file("Enter path to your .dat file: ")
+        raw_in = _ask_with_hint("Enter path to your .dat file: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_file()):
+            print("File not found.")
+            wait_enter()
+            return None
     else:
-        input_path = ask_existing_dir("Enter path to your .dat folder: ")
+        raw_in = _ask_with_hint("Enter path to your .dat folder: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_dir()):
+            print("Folder not found.")
+            wait_enter()
+            return None
+    update_setting("last_mp4_input", str(input_path))
 
     # crid.exe silently fails when the path contains spaces — warn immediately.
     if " " in str(input_path):
@@ -1343,10 +1558,24 @@ def prompt_mp3(single_or_batch):
     clear_screen()
     show_header()
 
+    s = load_settings()
+    last_in = s.get("last_mp3_input", "")
+
     if single_or_batch == "1":
-        input_path = ask_existing_file("Enter path to your .awb file: ")
+        raw_in = _ask_with_hint("Enter path to your .awb file: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_file()):
+            print("File not found.")
+            wait_enter()
+            return None
     else:
-        input_path = ask_existing_dir("Enter path to your .awb folder: ")
+        raw_in = _ask_with_hint("Enter path to your .awb folder: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_dir()):
+            print("Folder not found.")
+            wait_enter()
+            return None
+    update_setting("last_mp3_input", str(input_path))
 
     output_path = ask_output_dir("Enter output folder: ")
 
@@ -1366,10 +1595,24 @@ def prompt_flac(single_or_batch):
     clear_screen()
     show_header()
 
+    s = load_settings()
+    last_in = s.get("last_flac_input", "")
+
     if single_or_batch == "1":
-        input_path = ask_existing_file("Enter path to your .awb file: ")
+        raw_in = _ask_with_hint("Enter path to your .awb file: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_file()):
+            print("File not found.")
+            wait_enter()
+            return None
     else:
-        input_path = ask_existing_dir("Enter path to your .awb folder: ")
+        raw_in = _ask_with_hint("Enter path to your .awb folder: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_dir()):
+            print("Folder not found.")
+            wait_enter()
+            return None
+    update_setting("last_flac_input", str(input_path))
 
     output_path = ask_output_dir("Enter output folder: ")
 
@@ -1463,10 +1706,24 @@ def prompt_image(single_or_batch):
     clear_screen()
     show_header()
 
+    s = load_settings()
+    last_in = s.get("last_image_input", "")
+
     if single_or_batch == "1":
-        input_path = ask_existing_file("Enter path to your .ab file: ")
+        raw_in = _ask_with_hint("Enter path to your .ab file: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_file()):
+            print("File not found.")
+            wait_enter()
+            return None
     else:
-        input_path = ask_existing_dir("Enter path to your .ab folder: ")
+        raw_in = _ask_with_hint("Enter path to your .ab folder: ", last_in)
+        input_path = Path(raw_in)
+        if not (input_path.exists() and input_path.is_dir()):
+            print("Folder not found.")
+            wait_enter()
+            return None
+    update_setting("last_image_input", str(input_path))
 
     output_path = ask_output_dir("Enter output folder: ")
 
@@ -1507,6 +1764,13 @@ _SETTINGS_DEFAULTS = {
     "default_display_mode": "",   # "1" or "2" — blank = always ask
     "default_categorization": "", # "0"-"6"  — blank = always ask
     "temp_cleanup": "auto",       # "auto" | "keep" | "batch"
+    "retry_count": 1,             # 1–3: attempts per file before marking failed
+    "parallel_workers": 2,        # workers for mp3/flac parallel conversion (1 = sequential)
+    "notify_on_complete": True,   # beep + Windows notification when batch finishes
+    "last_mp4_input": "",
+    "last_mp3_input": "",
+    "last_flac_input": "",
+    "last_image_input": "",
 }
 
 def load_settings() -> dict:
@@ -1962,7 +2226,6 @@ def run_mp4_shell(payload, display_mode, resolved_tools):
     print(f"Mode: {mode_type}")
     print(f"Input: {input_path}")
     print(f"Output: {output_root}\n")
-
     print(f".dat files found: {len(dat_files)}")
 
     if not dat_files:
@@ -1970,132 +2233,136 @@ def run_mp4_shell(payload, display_mode, resolved_tools):
         wait_enter()
         return 0, 0, 1, log_path
 
-    success = 0
-    missing = 0
-    failed = 0
-    log_lines = []
-    cleanup_policy = load_settings().get("temp_cleanup", "auto")
+    s = load_settings()
+    cleanup_policy  = s.get("temp_cleanup", "auto")
+    retry_count     = max(1, int(s.get("retry_count", 1)))
     deferred_temps: list = []
 
     output_root.mkdir(parents=True, exist_ok=True)
     pause_each_file = (display_mode == "2" and mode_type == "single")
 
-    for idx, dat_file in enumerate(dat_files, start=1):
+    success = 0
+    missing = 0
+    failed  = 0
+    log_lines: list = []
+    failed_files: list = []
+    start_ts = time.time()
+
+    def _process_dat(dat_file, idx, total):
+        """Process one .dat file with retry. Returns ('ok'|'missing'|'failed', log_entries)."""
         out_mp4 = build_mp4_output_path(dat_file, output_root)
+        if not should_process_output(out_mp4, policy, []):
+            return "skip", [f"[SKIPPED] {dat_file}"]
 
-        if not should_process_output(out_mp4, policy, log_lines):
-            continue
-
-        crid_cmd = build_crid_command(dat_file, resolved_tools)
+        crid_cmd     = build_crid_command(dat_file, resolved_tools)
         crid_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in crid_cmd)
 
         if display_mode == "2":
             clear_screen()
             show_header()
             print("MP4 Conversion\n")
-            print(f"[{idx}/{len(dat_files)}] {dat_file}\n")
+            print(f"[{idx}/{total}] {dat_file}\n")
             print("Running crid_mod:")
             print(crid_cmd_str)
             print()
+        elif display_mode == "1":
+            _print_progress(idx, total, dat_file.name, start_ts)
 
-        try:
-            if display_mode == "2":
-                crid_result = _run_with_spinner(
-                    lambda: run_crid_safe(crid_cmd, cwd=SCRIPT_ROOT),
-                    "Running crid_mod...",
-                )
-            else:
-                crid_result = run_crid_safe(crid_cmd, cwd=SCRIPT_ROOT)
-            crid_stdout = crid_result.stdout.strip() if crid_result.stdout else ""
-            crid_stderr = crid_result.stderr.strip() if crid_result.stderr else ""
-
-            extracted_m2v = find_extracted_m2v_for_dat(dat_file)
-
-            if extracted_m2v is None or not extracted_m2v.exists():
-                # crid sometimes exits non-zero but still writes the m2v — only fail if no output
-                missing += 1
-                _space_hint = (
-                    " (crid.exe cannot handle paths with spaces — move files to a folder with no spaces in its name)"
-                    if " " in str(dat_file) else ""
-                )
-                log_lines.extend([
-                    "=" * 80,
-                    f"[MISSING] {dat_file}",
-                    "STEP: crid_mod output",
-                    f"COMMAND: {crid_cmd_str}",
-                    f"RETURN CODE: {crid_result.returncode}",
-                    "STDOUT:", crid_stdout if crid_stdout else "(empty)",
-                    "STDERR:", crid_stderr if crid_stderr else "(empty)",
-                    f"DETAIL: No extracted .m2v found beside source .dat{_space_hint}",
-                ])
+        last_exc = None
+        for _attempt in range(retry_count):
+            if _attempt > 0:
                 if display_mode == "2":
-                    if _space_hint:
+                    print(f"  Retrying ({_attempt}/{retry_count - 1})...")
+                elif display_mode == "1":
+                    _print_progress(idx, total, f"(retry {_attempt}) {dat_file.name}", start_ts)
+            try:
+                if display_mode == "2":
+                    crid_result = _run_with_spinner(
+                        lambda: run_crid_safe(crid_cmd, cwd=SCRIPT_ROOT),
+                        "Running crid_mod...",
+                    )
+                else:
+                    crid_result = run_crid_safe(crid_cmd, cwd=SCRIPT_ROOT)
+                crid_stdout = crid_result.stdout.strip() if crid_result.stdout else ""
+                crid_stderr = crid_result.stderr.strip() if crid_result.stderr else ""
+
+                extracted_m2v = find_extracted_m2v_for_dat(dat_file)
+                if extracted_m2v is None or not extracted_m2v.exists():
+                    if _attempt < retry_count - 1:
+                        continue
+                    _space_hint = (
+                        " (crid.exe cannot handle paths with spaces — move files to a folder with no spaces)"
+                        if " " in str(dat_file) else ""
+                    )
+                    if display_mode == "2":
                         print(f"No extracted .m2v found.{_space_hint}\n")
-                    else:
-                        print("No extracted .m2v found.\n")
+                        if pause_each_file:
+                            wait_enter()
+                    return "missing", [
+                        "=" * 80,
+                        f"[MISSING] {dat_file}",
+                        "STEP: crid_mod output",
+                        f"COMMAND: {crid_cmd_str}",
+                        f"RETURN CODE: {crid_result.returncode}",
+                        "STDOUT:", crid_stdout or "(empty)",
+                        "STDERR:", crid_stderr or "(empty)",
+                        f"DETAIL: No extracted .m2v found beside source .dat{_space_hint}",
+                    ]
+
+                ffmpeg_cmd     = build_ffmpeg_mp4_command(extracted_m2v, out_mp4, resolved_tools)
+                ffmpeg_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in ffmpeg_cmd)
+
+                if display_mode == "2":
+                    print(f"Extracted .m2v: {extracted_m2v}\n")
+                    print("Running ffmpeg:")
+                    print(ffmpeg_cmd_str)
+                    print()
+
+                ffmpeg_result  = run_subprocess_safe(ffmpeg_cmd, cwd=SCRIPT_ROOT)
+                ffmpeg_stdout  = ffmpeg_result.stdout.strip() if ffmpeg_result.stdout else ""
+                ffmpeg_stderr  = ffmpeg_result.stderr.strip() if ffmpeg_result.stderr else ""
+
+                if display_mode == "2":
+                    print(f"ffmpeg return code: {ffmpeg_result.returncode}\n")
+                    if ffmpeg_stdout:
+                        print("FFMPEG STDOUT:")
+                        print(ffmpeg_stdout)
+                        print()
+                    if ffmpeg_stderr:
+                        print("FFMPEG STDERR:")
+                        print(ffmpeg_stderr)
+                        print()
                     if pause_each_file:
                         wait_enter()
-                continue
 
-            ffmpeg_cmd = build_ffmpeg_mp4_command(extracted_m2v, out_mp4, resolved_tools)
+                if ffmpeg_result.returncode == 0 and out_mp4.exists():
+                    _handle_temp_cleanup(extracted_m2v, cleanup_policy, deferred_temps)
+                    _note = {"auto": f"Deleted temp: {extracted_m2v}",
+                             "keep": f"Kept temp: {extracted_m2v}",
+                             "batch": f"Queued: {extracted_m2v}"}.get(cleanup_policy, "")
+                    return "ok", [
+                        "=" * 80,
+                        f"[OK] {dat_file}",
+                        f"EXTRACTED M2V: {extracted_m2v}",
+                        f"OUTPUT MP4: {out_mp4}",
+                        "STEP: crid_mod",
+                        f"COMMAND: {crid_cmd_str}",
+                        f"RETURN CODE: {crid_result.returncode}",
+                        "STDOUT:", crid_stdout or "(empty)",
+                        "STDERR:", crid_stderr or "(empty)",
+                        "STEP: ffmpeg",
+                        f"COMMAND: {ffmpeg_cmd_str}",
+                        f"RETURN CODE: {ffmpeg_result.returncode}",
+                        "STDOUT:", ffmpeg_stdout or "(empty)",
+                        "STDERR:", ffmpeg_stderr or "(empty)",
+                        "CLEANUP:", _note,
+                    ]
 
-            ffmpeg_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in ffmpeg_cmd)
-
-            if display_mode == "2":
-                print("Extracted .m2v:")
-                print(str(extracted_m2v))
-                print()
-                print("Running ffmpeg:")
-                print(ffmpeg_cmd_str)
-                print()
-
-            ffmpeg_result = run_subprocess_safe(ffmpeg_cmd, cwd=SCRIPT_ROOT)
-            ffmpeg_stdout = ffmpeg_result.stdout.strip() if ffmpeg_result.stdout else ""
-            ffmpeg_stderr = ffmpeg_result.stderr.strip() if ffmpeg_result.stderr else ""
-
-            if display_mode == "2":
-                print(f"ffmpeg return code: {ffmpeg_result.returncode}\n")
-                if ffmpeg_stdout:
-                    print("FFMPEG STDOUT:")
-                    print(ffmpeg_stdout)
-                    print()
-                if ffmpeg_stderr:
-                    print("FFMPEG STDERR:")
-                    print(ffmpeg_stderr)
-                    print()
-                if pause_each_file:
-                    wait_enter()
-
-            if ffmpeg_result.returncode == 0 and out_mp4.exists():
-                _handle_temp_cleanup(extracted_m2v, cleanup_policy, deferred_temps)
-                success += 1
-                _cleanup_note = {
-                    "auto": f"Deleted temp file: {extracted_m2v}",
-                    "keep": f"Kept temp file: {extracted_m2v}",
-                    "batch": f"Queued for cleanup: {extracted_m2v}",
-                }.get(cleanup_policy, "")
-                log_lines.extend([
-                    "=" * 80,
-                    f"[OK] {dat_file}",
-                    f"EXTRACTED M2V: {extracted_m2v}",
-                    f"OUTPUT MP4: {out_mp4}",
-                    "STEP: crid_mod",
-                    f"COMMAND: {crid_cmd_str}",
-                    f"RETURN CODE: {crid_result.returncode}",
-                    "STDOUT:", crid_stdout if crid_stdout else "(empty)",
-                    "STDERR:", crid_stderr if crid_stderr else "(empty)",
-                    "STEP: ffmpeg",
-                    f"COMMAND: {ffmpeg_cmd_str}",
-                    f"RETURN CODE: {ffmpeg_result.returncode}",
-                    "STDOUT:", ffmpeg_stdout if ffmpeg_stdout else "(empty)",
-                    "STDERR:", ffmpeg_stderr if ffmpeg_stderr else "(empty)",
-                    "CLEANUP:",
-                    _cleanup_note,
-                ])
-            else:
+                # ffmpeg failed — retry or give up
                 cleanup_temp_video_files(out_mp4)
-                failed += 1
-                log_lines.extend([
+                if _attempt < retry_count - 1:
+                    continue
+                return "failed", [
                     "=" * 80,
                     f"[FAILED] {dat_file}",
                     f"EXTRACTED M2V: {extracted_m2v}",
@@ -2103,32 +2370,67 @@ def run_mp4_shell(payload, display_mode, resolved_tools):
                     "STEP: crid_mod",
                     f"COMMAND: {crid_cmd_str}",
                     f"RETURN CODE: {crid_result.returncode}",
-                    "STDOUT:", crid_stdout if crid_stdout else "(empty)",
-                    "STDERR:", crid_stderr if crid_stderr else "(empty)",
+                    "STDOUT:", crid_stdout or "(empty)",
+                    "STDERR:", crid_stderr or "(empty)",
                     "STEP: ffmpeg",
                     f"COMMAND: {ffmpeg_cmd_str}",
                     f"RETURN CODE: {ffmpeg_result.returncode}",
-                    "STDOUT:", ffmpeg_stdout if ffmpeg_stdout else "(empty)",
-                    "STDERR:", ffmpeg_stderr if ffmpeg_stderr else "(empty)",
-                ])
+                    "STDOUT:", ffmpeg_stdout or "(empty)",
+                    "STDERR:", ffmpeg_stderr or "(empty)",
+                ]
 
-        except Exception as e:
+            except Exception as e:
+                last_exc = e
+                if _attempt < retry_count - 1:
+                    continue
+                if display_mode == "2" and pause_each_file:
+                    print(f"EXCEPTION: {e}\n")
+                    wait_enter()
+                return "failed", [
+                    "=" * 80,
+                    f"[ERROR] {dat_file}",
+                    "EXCEPTION:", str(last_exc),
+                ]
+        return "failed", ["=" * 80, f"[ERROR] {dat_file}", "Unknown failure"]
+
+    for idx, dat_file in enumerate(dat_files, start=1):
+        status, entries = _process_dat(dat_file, idx, len(dat_files))
+        log_lines.extend(entries)
+        if status == "ok":
+            success += 1
+        elif status == "missing":
+            missing += 1
+        elif status == "failed":
             failed += 1
-            log_lines.extend([
-                "=" * 80,
-                f"[ERROR] {dat_file}",
-                "EXCEPTION:",
-                str(e),
-            ])
-            if display_mode == "2" and pause_each_file:
-                print("EXCEPTION:")
-                print(str(e))
-                print()
-                wait_enter()
+            failed_files.append(dat_file)
+
+    if display_mode == "1":
+        _end_progress(len(dat_files))
+
+    # ── retry-failed prompt ─────────────────────────────────────────────────
+    if failed_files:
+        print(f"\n{failed} file(s) failed.")
+        if ask_yes_no("Retry failed files now? (y/n): "):
+            retry_log: list = []
+            for idx, dat_file in enumerate(failed_files, start=1):
+                status, entries = _process_dat(dat_file, idx, len(failed_files))
+                retry_log.extend(entries)
+                if status == "ok":
+                    success += 1
+                    failed -= 1
+                elif status == "missing":
+                    missing += 1
+                    failed -= 1
+            log_lines.append("=" * 80)
+            log_lines.append("[RETRY RUN]")
+            log_lines.extend(retry_log)
+            if display_mode == "1":
+                _end_progress(len(failed_files))
 
     for p in deferred_temps:
         safe_delete(p)
 
+    elapsed = time.time() - start_ts
     with open(log_path, "w", encoding="utf-8") as f:
         for line in log_lines:
             f.write(line + "\n")
@@ -2187,156 +2489,154 @@ def run_mp3_shell(payload, display_mode, resolved_tools):
     print(f"Mode: {mode_type}")
     print(f"Input: {input_path}")
     print(f"Output: {output_root}\n")
-
     print(f".awb files found: {len(awb_files)}")
-    if awb_files:
-        print("\nSample files:")
-        for p in awb_files[:10]:
-            print(f"  {p}")
 
     if not awb_files:
         print("\nNo .awb files found.")
         wait_enter()
         return 0, 0, 1, log_path
 
-    success = 0
-    missing = 0
-    failed = 0
-    log_lines = []
-    cleanup_policy = load_settings().get("temp_cleanup", "auto")
+    s = load_settings()
+    cleanup_policy = s.get("temp_cleanup", "auto")
+    retry_count    = max(1, int(s.get("retry_count", 1)))
+    workers        = max(1, int(s.get("parallel_workers", 2)))
     deferred_temps: list = []
 
     output_root.mkdir(parents=True, exist_ok=True)
     pause_each_file = (display_mode == "2" and mode_type == "single")
 
-    for idx, awb_file in enumerate(awb_files, start=1):
+    success = 0
+    missing = 0
+    failed  = 0
+    log_lines: list = []
+    failed_files: list = []
+    start_ts = time.time()
+
+    def _process_awb_mp3(awb_file, idx, total, _dm=None):
+        """_dm overrides display_mode; pass '0' for silent (parallel mode)."""
+        dm = _dm if _dm is not None else display_mode
         temp_wav = build_temp_wav_path(awb_file)
-        out_mp3 = build_mp3_output_path(awb_file, output_root)
+        out_mp3  = build_mp3_output_path(awb_file, output_root)
+        if not should_process_output(out_mp3, policy, []):
+            return "skip", [f"[SKIPPED] {awb_file}"]
 
-        if not should_process_output(out_mp3, policy, log_lines):
-            continue
-
-        vgm_cmd = build_vgmstream_wav_command(awb_file, temp_wav, resolved_tools)
+        vgm_cmd     = build_vgmstream_wav_command(awb_file, temp_wav, resolved_tools)
         vgm_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in vgm_cmd)
 
-        if display_mode == "2":
+        if dm == "2":
             clear_screen()
             show_header()
             print("MP3 Conversion\n")
-            print(f"[{idx}/{len(awb_files)}] {awb_file}\n")
+            print(f"[{idx}/{total}] {awb_file}\n")
             print("Running vgmstream:")
             print(vgm_cmd_str)
             print()
+        elif dm == "1":
+            _print_progress(idx, total, awb_file.name, start_ts)
 
-        try:
-            if temp_wav.exists():
-                safe_delete(temp_wav)
+        last_exc = None
+        for _attempt in range(retry_count):
+            if _attempt > 0:
+                if dm == "2":
+                    print(f"  Retrying ({_attempt}/{retry_count - 1})...")
+                elif dm == "1":
+                    _print_progress(idx, total, f"(retry {_attempt}) {awb_file.name}", start_ts)
+            try:
+                if temp_wav.exists():
+                    safe_delete(temp_wav)
 
-            vgm_result = run_subprocess_safe(vgm_cmd, cwd=SCRIPT_ROOT)
-            vgm_stdout = vgm_result.stdout.strip() if vgm_result.stdout else ""
-            vgm_stderr = vgm_result.stderr.strip() if vgm_result.stderr else ""
+                vgm_result  = run_subprocess_safe(vgm_cmd, cwd=SCRIPT_ROOT)
+                vgm_stdout  = vgm_result.stdout.strip() if vgm_result.stdout else ""
+                vgm_stderr  = vgm_result.stderr.strip() if vgm_result.stderr else ""
 
-            if vgm_result.returncode != 0:
-                failed += 1
-                log_lines.extend([
-                    "=" * 80,
-                    f"[FAILED] {awb_file}",
-                    "STEP: vgmstream",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                ])
-                if display_mode == "2":
-                    print(f"Return code: {vgm_result.returncode}\n")
-                    if vgm_stdout:
-                        print("STDOUT:")
-                        print(vgm_stdout)
+                if vgm_result.returncode != 0:
+                    if _attempt < retry_count - 1:
+                        continue
+                    if dm == "2":
+                        print(f"Return code: {vgm_result.returncode}\n")
+                        if pause_each_file:
+                            wait_enter()
+                    return "failed", [
+                        "=" * 80,
+                        f"[FAILED] {awb_file}",
+                        "STEP: vgmstream",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                    ]
+
+                if not temp_wav.exists():
+                    if _attempt < retry_count - 1:
+                        continue
+                    if dm == "2":
+                        print("No extracted .wav found.\n")
+                        if pause_each_file:
+                            wait_enter()
+                    return "missing", [
+                        "=" * 80,
+                        f"[MISSING] {awb_file}",
+                        "STEP: vgmstream output",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                        "DETAIL: No extracted .wav found beside source .awb",
+                    ]
+
+                ffmpeg_cmd     = build_ffmpeg_mp3_command(temp_wav, out_mp3, resolved_tools)
+                ffmpeg_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in ffmpeg_cmd)
+
+                if dm == "2":
+                    print(f"Extracted .wav: {temp_wav}\n")
+                    print("Running ffmpeg:")
+                    print(ffmpeg_cmd_str)
+                    print()
+
+                ffmpeg_result = run_subprocess_safe(ffmpeg_cmd, cwd=SCRIPT_ROOT)
+                ffmpeg_stdout = ffmpeg_result.stdout.strip() if ffmpeg_result.stdout else ""
+                ffmpeg_stderr = ffmpeg_result.stderr.strip() if ffmpeg_result.stderr else ""
+
+                if dm == "2":
+                    print(f"ffmpeg return code: {ffmpeg_result.returncode}\n")
+                    if ffmpeg_stdout:
+                        print("FFMPEG STDOUT:")
+                        print(ffmpeg_stdout)
                         print()
-                    if vgm_stderr:
-                        print("STDERR:")
-                        print(vgm_stderr)
+                    if ffmpeg_stderr:
+                        print("FFMPEG STDERR:")
+                        print(ffmpeg_stderr)
                         print()
                     if pause_each_file:
                         wait_enter()
-                continue
 
-            if not temp_wav.exists():
-                missing += 1
-                log_lines.extend([
-                    "=" * 80,
-                    f"[MISSING] {awb_file}",
-                    "STEP: vgmstream output",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                    "DETAIL: No extracted .wav found beside source .awb",
-                ])
-                if display_mode == "2":
-                    print("No extracted .wav found.\n")
-                    if pause_each_file:
-                        wait_enter()
-                continue
+                if ffmpeg_result.returncode == 0 and out_mp3.exists():
+                    _handle_temp_cleanup(temp_wav, cleanup_policy, deferred_temps)
+                    _note = {"auto": f"Deleted temp: {temp_wav}",
+                             "keep": f"Kept temp: {temp_wav}",
+                             "batch": f"Queued: {temp_wav}"}.get(cleanup_policy, "")
+                    return "ok", [
+                        "=" * 80,
+                        f"[OK] {awb_file}",
+                        f"TEMP WAV: {temp_wav}",
+                        f"OUTPUT MP3: {out_mp3}",
+                        "STEP: vgmstream",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                        "STEP: ffmpeg",
+                        f"COMMAND: {ffmpeg_cmd_str}",
+                        f"RETURN CODE: {ffmpeg_result.returncode}",
+                        "STDOUT:", ffmpeg_stdout or "(empty)",
+                        "STDERR:", ffmpeg_stderr or "(empty)",
+                        "CLEANUP:", _note,
+                    ]
 
-            ffmpeg_cmd = build_ffmpeg_mp3_command(temp_wav, out_mp3, resolved_tools)
-            ffmpeg_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in ffmpeg_cmd)
-
-            if display_mode == "2":
-                print("Extracted .wav:")
-                print(str(temp_wav))
-                print()
-                print("Running ffmpeg:")
-                print(ffmpeg_cmd_str)
-                print()
-
-            ffmpeg_result = run_subprocess_safe(ffmpeg_cmd, cwd=SCRIPT_ROOT)
-            ffmpeg_stdout = ffmpeg_result.stdout.strip() if ffmpeg_result.stdout else ""
-            ffmpeg_stderr = ffmpeg_result.stderr.strip() if ffmpeg_result.stderr else ""
-
-            if display_mode == "2":
-                print(f"ffmpeg return code: {ffmpeg_result.returncode}\n")
-                if ffmpeg_stdout:
-                    print("FFMPEG STDOUT:")
-                    print(ffmpeg_stdout)
-                    print()
-                if ffmpeg_stderr:
-                    print("FFMPEG STDERR:")
-                    print(ffmpeg_stderr)
-                    print()
-                if pause_each_file:
-                    wait_enter()
-
-            if ffmpeg_result.returncode == 0 and out_mp3.exists():
-                _handle_temp_cleanup(temp_wav, cleanup_policy, deferred_temps)
-                success += 1
-                _cleanup_note = {
-                    "auto": f"Deleted temp file: {temp_wav}",
-                    "keep": f"Kept temp file: {temp_wav}",
-                    "batch": f"Queued for cleanup: {temp_wav}",
-                }.get(cleanup_policy, "")
-                log_lines.extend([
-                    "=" * 80,
-                    f"[OK] {awb_file}",
-                    f"TEMP WAV: {temp_wav}",
-                    f"OUTPUT MP3: {out_mp3}",
-                    "STEP: vgmstream",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                    "STEP: ffmpeg",
-                    f"COMMAND: {ffmpeg_cmd_str}",
-                    f"RETURN CODE: {ffmpeg_result.returncode}",
-                    "STDOUT:", ffmpeg_stdout if ffmpeg_stdout else "(empty)",
-                    "STDERR:", ffmpeg_stderr if ffmpeg_stderr else "(empty)",
-                    "CLEANUP:",
-                    _cleanup_note,
-                ])
-            else:
                 safe_delete(out_mp3)
-                failed += 1
-                log_lines.extend([
+                if _attempt < retry_count - 1:
+                    continue
+                return "failed", [
                     "=" * 80,
                     f"[FAILED] {awb_file}",
                     f"TEMP WAV: {temp_wav}",
@@ -2344,32 +2644,94 @@ def run_mp3_shell(payload, display_mode, resolved_tools):
                     "STEP: vgmstream",
                     f"COMMAND: {vgm_cmd_str}",
                     f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
+                    "STDOUT:", vgm_stdout or "(empty)",
+                    "STDERR:", vgm_stderr or "(empty)",
                     "STEP: ffmpeg",
                     f"COMMAND: {ffmpeg_cmd_str}",
                     f"RETURN CODE: {ffmpeg_result.returncode}",
-                    "STDOUT:", ffmpeg_stdout if ffmpeg_stdout else "(empty)",
-                    "STDERR:", ffmpeg_stderr if ffmpeg_stderr else "(empty)",
-                ])
+                    "STDOUT:", ffmpeg_stdout or "(empty)",
+                    "STDERR:", ffmpeg_stderr or "(empty)",
+                ]
 
-        except Exception as e:
+            except Exception as e:
+                last_exc = e
+                if _attempt < retry_count - 1:
+                    continue
+                if dm == "2" and pause_each_file:
+                    print(f"EXCEPTION: {e}\n")
+                    wait_enter()
+                return "failed", [
+                    "=" * 80,
+                    f"[ERROR] {awb_file}",
+                    "EXCEPTION:", str(last_exc),
+                ]
+        return "failed", ["=" * 80, f"[ERROR] {awb_file}", "Unknown failure"]
+
+    def _collect(status, entries, awb_file):
+        nonlocal success, missing, failed
+        log_lines.extend(entries)
+        if status == "ok":
+            success += 1
+        elif status == "missing":
+            missing += 1
+        elif status == "failed":
             failed += 1
-            log_lines.extend([
-                "=" * 80,
-                f"[ERROR] {awb_file}",
-                "EXCEPTION:",
-                str(e),
-            ])
-            if display_mode == "2" and pause_each_file:
-                print("EXCEPTION:")
-                print(str(e))
-                print()
-                wait_enter()
+            failed_files.append(awb_file)
+
+    use_parallel = workers > 1 and display_mode != "2"
+    if use_parallel:
+        import concurrent.futures, threading
+        _lock = threading.Lock()
+        _done = 0
+        if display_mode == "1":
+            print(f"\nRunning with {workers} parallel workers...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_process_awb_mp3, f, 0, len(awb_files), "0"): f
+                for f in awb_files
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                awb_file = future_map[future]
+                try:
+                    status, entries = future.result()
+                except Exception as e:
+                    status, entries = "failed", ["=" * 80, f"[ERROR] {awb_file}", "EXCEPTION:", str(e)]
+                with _lock:
+                    _done += 1
+                    _collect(status, entries, awb_file)
+                    if display_mode == "1":
+                        _print_progress(_done, len(awb_files), awb_file.name, start_ts)
+    else:
+        for idx, awb_file in enumerate(awb_files, start=1):
+            status, entries = _process_awb_mp3(awb_file, idx, len(awb_files))
+            _collect(status, entries, awb_file)
+
+    if display_mode == "1":
+        _end_progress(len(awb_files))
+
+    if failed_files:
+        print(f"\n{failed} file(s) failed.")
+        if ask_yes_no("Retry failed files now? (y/n): "):
+            retry_log: list = []
+            for idx, awb_file in enumerate(failed_files, start=1):
+                status, entries = _process_awb_mp3(awb_file, idx, len(failed_files))
+                retry_log.extend(entries)
+                if status == "ok":
+                    success += 1
+                    failed -= 1
+                elif status == "missing":
+                    missing += 1
+                    failed -= 1
+            log_lines.append("=" * 80)
+            log_lines.append("[RETRY RUN]")
+            log_lines.extend(retry_log)
+            if display_mode == "1":
+                _end_progress(len(failed_files))
 
     for p in deferred_temps:
         safe_delete(p)
 
+    elapsed = time.time() - start_ts
     with open(log_path, "w", encoding="utf-8") as f:
         for line in log_lines:
             f.write(line + "\n")
@@ -2403,156 +2765,154 @@ def run_flac_shell(payload, display_mode, resolved_tools):
     print(f"Mode: {mode_type}")
     print(f"Input: {input_path}")
     print(f"Output: {output_root}\n")
-
     print(f".awb files found: {len(awb_files)}")
-    if awb_files:
-        print("\nSample files:")
-        for p in awb_files[:10]:
-            print(f"  {p}")
 
     if not awb_files:
         print("\nNo .awb files found.")
         wait_enter()
         return 0, 0, 1, log_path
 
-    success = 0
-    missing = 0
-    failed = 0
-    log_lines = []
-    cleanup_policy = load_settings().get("temp_cleanup", "auto")
+    s = load_settings()
+    cleanup_policy = s.get("temp_cleanup", "auto")
+    retry_count    = max(1, int(s.get("retry_count", 1)))
+    workers        = max(1, int(s.get("parallel_workers", 2)))
     deferred_temps: list = []
 
     output_root.mkdir(parents=True, exist_ok=True)
     pause_each_file = (display_mode == "2" and mode_type == "single")
 
-    for idx, awb_file in enumerate(awb_files, start=1):
+    success = 0
+    missing = 0
+    failed  = 0
+    log_lines: list = []
+    failed_files: list = []
+    start_ts = time.time()
+
+    def _process_awb_flac(awb_file, idx, total, _dm=None):
+        """_dm overrides display_mode; pass '0' for silent (parallel mode)."""
+        dm = _dm if _dm is not None else display_mode
         temp_wav = build_temp_wav_path(awb_file)
         out_flac = build_flac_output_path(awb_file, output_root)
+        if not should_process_output(out_flac, policy, []):
+            return "skip", [f"[SKIPPED] {awb_file}"]
 
-        if not should_process_output(out_flac, policy, log_lines):
-            continue
-
-        vgm_cmd = build_vgmstream_wav_command(awb_file, temp_wav, resolved_tools)
+        vgm_cmd     = build_vgmstream_wav_command(awb_file, temp_wav, resolved_tools)
         vgm_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in vgm_cmd)
 
-        if display_mode == "2":
+        if dm == "2":
             clear_screen()
             show_header()
             print("FLAC Conversion\n")
-            print(f"[{idx}/{len(awb_files)}] {awb_file}\n")
+            print(f"[{idx}/{total}] {awb_file}\n")
             print("Running vgmstream:")
             print(vgm_cmd_str)
             print()
+        elif dm == "1":
+            _print_progress(idx, total, awb_file.name, start_ts)
 
-        try:
-            if temp_wav.exists():
-                safe_delete(temp_wav)
+        last_exc = None
+        for _attempt in range(retry_count):
+            if _attempt > 0:
+                if dm == "2":
+                    print(f"  Retrying ({_attempt}/{retry_count - 1})...")
+                elif dm == "1":
+                    _print_progress(idx, total, f"(retry {_attempt}) {awb_file.name}", start_ts)
+            try:
+                if temp_wav.exists():
+                    safe_delete(temp_wav)
 
-            vgm_result = run_subprocess_safe(vgm_cmd, cwd=SCRIPT_ROOT)
-            vgm_stdout = vgm_result.stdout.strip() if vgm_result.stdout else ""
-            vgm_stderr = vgm_result.stderr.strip() if vgm_result.stderr else ""
+                vgm_result  = run_subprocess_safe(vgm_cmd, cwd=SCRIPT_ROOT)
+                vgm_stdout  = vgm_result.stdout.strip() if vgm_result.stdout else ""
+                vgm_stderr  = vgm_result.stderr.strip() if vgm_result.stderr else ""
 
-            if vgm_result.returncode != 0:
-                failed += 1
-                log_lines.extend([
-                    "=" * 80,
-                    f"[FAILED] {awb_file}",
-                    "STEP: vgmstream",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                ])
-                if display_mode == "2":
-                    print(f"Return code: {vgm_result.returncode}\n")
-                    if vgm_stdout:
-                        print("STDOUT:")
-                        print(vgm_stdout)
+                if vgm_result.returncode != 0:
+                    if _attempt < retry_count - 1:
+                        continue
+                    if dm == "2":
+                        print(f"Return code: {vgm_result.returncode}\n")
+                        if pause_each_file:
+                            wait_enter()
+                    return "failed", [
+                        "=" * 80,
+                        f"[FAILED] {awb_file}",
+                        "STEP: vgmstream",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                    ]
+
+                if not temp_wav.exists():
+                    if _attempt < retry_count - 1:
+                        continue
+                    if dm == "2":
+                        print("No extracted .wav found.\n")
+                        if pause_each_file:
+                            wait_enter()
+                    return "missing", [
+                        "=" * 80,
+                        f"[MISSING] {awb_file}",
+                        "STEP: vgmstream output",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                        "DETAIL: No extracted .wav found beside source .awb",
+                    ]
+
+                flac_cmd     = build_flac_encode_command(temp_wav, out_flac, resolved_tools)
+                flac_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in flac_cmd)
+
+                if dm == "2":
+                    print(f"Extracted .wav: {temp_wav}\n")
+                    print("Running flac:")
+                    print(flac_cmd_str)
+                    print()
+
+                flac_result  = run_subprocess_safe(flac_cmd, cwd=SCRIPT_ROOT)
+                flac_stdout  = flac_result.stdout.strip() if flac_result.stdout else ""
+                flac_stderr  = flac_result.stderr.strip() if flac_result.stderr else ""
+
+                if dm == "2":
+                    print(f"flac return code: {flac_result.returncode}\n")
+                    if flac_stdout:
+                        print("FLAC STDOUT:")
+                        print(flac_stdout)
                         print()
-                    if vgm_stderr:
-                        print("STDERR:")
-                        print(vgm_stderr)
+                    if flac_stderr:
+                        print("FLAC STDERR:")
+                        print(flac_stderr)
                         print()
                     if pause_each_file:
                         wait_enter()
-                continue
 
-            if not temp_wav.exists():
-                missing += 1
-                log_lines.extend([
-                    "=" * 80,
-                    f"[MISSING] {awb_file}",
-                    "STEP: vgmstream output",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                    "DETAIL: No extracted .wav found beside source .awb",
-                ])
-                if display_mode == "2":
-                    print("No extracted .wav found.\n")
-                    if pause_each_file:
-                        wait_enter()
-                continue
+                if flac_result.returncode == 0 and out_flac.exists():
+                    _handle_temp_cleanup(temp_wav, cleanup_policy, deferred_temps)
+                    _note = {"auto": f"Deleted temp: {temp_wav}",
+                             "keep": f"Kept temp: {temp_wav}",
+                             "batch": f"Queued: {temp_wav}"}.get(cleanup_policy, "")
+                    return "ok", [
+                        "=" * 80,
+                        f"[OK] {awb_file}",
+                        f"TEMP WAV: {temp_wav}",
+                        f"OUTPUT FLAC: {out_flac}",
+                        "STEP: vgmstream",
+                        f"COMMAND: {vgm_cmd_str}",
+                        f"RETURN CODE: {vgm_result.returncode}",
+                        "STDOUT:", vgm_stdout or "(empty)",
+                        "STDERR:", vgm_stderr or "(empty)",
+                        "STEP: flac",
+                        f"COMMAND: {flac_cmd_str}",
+                        f"RETURN CODE: {flac_result.returncode}",
+                        "STDOUT:", flac_stdout or "(empty)",
+                        "STDERR:", flac_stderr or "(empty)",
+                        "CLEANUP:", _note,
+                    ]
 
-            flac_cmd = build_flac_encode_command(temp_wav, out_flac, resolved_tools)
-            flac_cmd_str = " ".join(f'"{str(x)}"' if " " in str(x) else str(x) for x in flac_cmd)
-
-            if display_mode == "2":
-                print("Extracted .wav:")
-                print(str(temp_wav))
-                print()
-                print("Running flac:")
-                print(flac_cmd_str)
-                print()
-
-            flac_result = run_subprocess_safe(flac_cmd, cwd=SCRIPT_ROOT)
-            flac_stdout = flac_result.stdout.strip() if flac_result.stdout else ""
-            flac_stderr = flac_result.stderr.strip() if flac_result.stderr else ""
-
-            if display_mode == "2":
-                print(f"flac return code: {flac_result.returncode}\n")
-                if flac_stdout:
-                    print("FLAC STDOUT:")
-                    print(flac_stdout)
-                    print()
-                if flac_stderr:
-                    print("FLAC STDERR:")
-                    print(flac_stderr)
-                    print()
-                if pause_each_file:
-                    wait_enter()
-
-            if flac_result.returncode == 0 and out_flac.exists():
-                _handle_temp_cleanup(temp_wav, cleanup_policy, deferred_temps)
-                success += 1
-                _cleanup_note = {
-                    "auto": f"Deleted temp file: {temp_wav}",
-                    "keep": f"Kept temp file: {temp_wav}",
-                    "batch": f"Queued for cleanup: {temp_wav}",
-                }.get(cleanup_policy, "")
-                log_lines.extend([
-                    "=" * 80,
-                    f"[OK] {awb_file}",
-                    f"TEMP WAV: {temp_wav}",
-                    f"OUTPUT FLAC: {out_flac}",
-                    "STEP: vgmstream",
-                    f"COMMAND: {vgm_cmd_str}",
-                    f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
-                    "STEP: flac",
-                    f"COMMAND: {flac_cmd_str}",
-                    f"RETURN CODE: {flac_result.returncode}",
-                    "STDOUT:", flac_stdout if flac_stdout else "(empty)",
-                    "STDERR:", flac_stderr if flac_stderr else "(empty)",
-                    "CLEANUP:",
-                    _cleanup_note,
-                ])
-            else:
                 safe_delete(out_flac)
-                failed += 1
-                log_lines.extend([
+                if _attempt < retry_count - 1:
+                    continue
+                return "failed", [
                     "=" * 80,
                     f"[FAILED] {awb_file}",
                     f"TEMP WAV: {temp_wav}",
@@ -2560,32 +2920,94 @@ def run_flac_shell(payload, display_mode, resolved_tools):
                     "STEP: vgmstream",
                     f"COMMAND: {vgm_cmd_str}",
                     f"RETURN CODE: {vgm_result.returncode}",
-                    "STDOUT:", vgm_stdout if vgm_stdout else "(empty)",
-                    "STDERR:", vgm_stderr if vgm_stderr else "(empty)",
+                    "STDOUT:", vgm_stdout or "(empty)",
+                    "STDERR:", vgm_stderr or "(empty)",
                     "STEP: flac",
                     f"COMMAND: {flac_cmd_str}",
                     f"RETURN CODE: {flac_result.returncode}",
-                    "STDOUT:", flac_stdout if flac_stdout else "(empty)",
-                    "STDERR:", flac_stderr if flac_stderr else "(empty)",
-                ])
+                    "STDOUT:", flac_stdout or "(empty)",
+                    "STDERR:", flac_stderr or "(empty)",
+                ]
 
-        except Exception as e:
+            except Exception as e:
+                last_exc = e
+                if _attempt < retry_count - 1:
+                    continue
+                if dm == "2" and pause_each_file:
+                    print(f"EXCEPTION: {e}\n")
+                    wait_enter()
+                return "failed", [
+                    "=" * 80,
+                    f"[ERROR] {awb_file}",
+                    "EXCEPTION:", str(last_exc),
+                ]
+        return "failed", ["=" * 80, f"[ERROR] {awb_file}", "Unknown failure"]
+
+    def _collect(status, entries, awb_file):
+        nonlocal success, missing, failed
+        log_lines.extend(entries)
+        if status == "ok":
+            success += 1
+        elif status == "missing":
+            missing += 1
+        elif status == "failed":
             failed += 1
-            log_lines.extend([
-                "=" * 80,
-                f"[ERROR] {awb_file}",
-                "EXCEPTION:",
-                str(e),
-            ])
-            if display_mode == "2" and pause_each_file:
-                print("EXCEPTION:")
-                print(str(e))
-                print()
-                wait_enter()
+            failed_files.append(awb_file)
+
+    use_parallel = workers > 1 and display_mode != "2"
+    if use_parallel:
+        import concurrent.futures, threading
+        _lock = threading.Lock()
+        _done = 0
+        if display_mode == "1":
+            print(f"\nRunning with {workers} parallel workers...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_process_awb_flac, f, 0, len(awb_files), "0"): f
+                for f in awb_files
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                awb_file = future_map[future]
+                try:
+                    status, entries = future.result()
+                except Exception as e:
+                    status, entries = "failed", ["=" * 80, f"[ERROR] {awb_file}", "EXCEPTION:", str(e)]
+                with _lock:
+                    _done += 1
+                    _collect(status, entries, awb_file)
+                    if display_mode == "1":
+                        _print_progress(_done, len(awb_files), awb_file.name, start_ts)
+    else:
+        for idx, awb_file in enumerate(awb_files, start=1):
+            status, entries = _process_awb_flac(awb_file, idx, len(awb_files))
+            _collect(status, entries, awb_file)
+
+    if display_mode == "1":
+        _end_progress(len(awb_files))
+
+    if failed_files:
+        print(f"\n{failed} file(s) failed.")
+        if ask_yes_no("Retry failed files now? (y/n): "):
+            retry_log: list = []
+            for idx, awb_file in enumerate(failed_files, start=1):
+                status, entries = _process_awb_flac(awb_file, idx, len(failed_files))
+                retry_log.extend(entries)
+                if status == "ok":
+                    success += 1
+                    failed -= 1
+                elif status == "missing":
+                    missing += 1
+                    failed -= 1
+            log_lines.append("=" * 80)
+            log_lines.append("[RETRY RUN]")
+            log_lines.extend(retry_log)
+            if display_mode == "1":
+                _end_progress(len(failed_files))
 
     for p in deferred_temps:
         safe_delete(p)
 
+    elapsed = time.time() - start_ts
     with open(log_path, "w", encoding="utf-8") as f:
         for line in log_lines:
             f.write(line + "\n")
@@ -2841,10 +3263,6 @@ def run_image_shell(payload, display_mode, resolved_tools):
         ab_files = list_files_with_ext(input_path, ".ab")
 
         print(f".ab files found: {len(ab_files)}")
-        if ab_files:
-            print("\nSample files:")
-            for p in ab_files[:10]:
-                print(f"  {p}")
 
         if not ab_files:
             print("\nNo .ab files found.")
@@ -4212,6 +4630,7 @@ def handle_mode(mode):
     resolved_tools = resolve_requirements(required_tools)
     display_mode = scene_display_mode()
 
+    start_ts = time.time()
     if mode == "1":
         success, missing, failed, log_path = run_mp4_shell(payload, display_mode, resolved_tools)
     elif mode == "2":
@@ -4224,8 +4643,13 @@ def handle_mode(mode):
         success, missing, failed, log_path = run_database_shell(payload, display_mode, resolved_tools)
     else:
         success, missing, failed, log_path = run_image_shell(payload, display_mode, resolved_tools)
+    elapsed = time.time() - start_ts
 
-    scene_completion(success, missing, failed, log_path)
+    scene_completion(
+        success, missing, failed, log_path,
+        output_path=payload.get("output_path"),
+        elapsed=elapsed,
+    )
 
 
 def main():
