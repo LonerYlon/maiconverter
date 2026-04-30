@@ -33,7 +33,6 @@ __pycache__/
 
 # Setup state
 .setup_done
-config.json
 
 # Stale compiled binaries
 ._cache_*.exe
@@ -41,23 +40,3 @@ config.json
 # Saved presets (personal, not for repo)
 .db_presets.json
 .mas_settings.json
-
-# Removed from repo — kept locally only
-maioconverter-custom/dist/
-maioconverter-custom/src/**/bin/
-maioconverter-custom/src/**/obj/
-_thirdparty/
-maichartconverter/
-docs/wiki/
-push-wiki.py
-crid/src-mod/
-crid/src-old/
-
-# Third-party binaries (download separately via setup.py)
-assetstudiocli/
-ffmpeg/
-flac/
-vgmstream-win64/
-maiforge/maiforge.exe
-crid/crid.exe
-crid/crid.exe_old
