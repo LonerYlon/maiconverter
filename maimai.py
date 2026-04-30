@@ -23,6 +23,8 @@ from converters.mp3 import (
     build_mp3_output_path as conv_build_mp3_output_path,
     build_temp_wav_path as conv_build_temp_wav_path,
     build_vgmstream_wav_command as conv_build_vgmstream_wav_command,
+    get_preview_timing as conv_get_preview_timing,
+    inject_demo_timing_into_maidata as conv_inject_demo_timing_into_maidata,
 )
 from converters.mp4 import (
     ENCODER_PROFILES as mp4_ENCODER_PROFILES,
@@ -958,7 +960,7 @@ def scene_settings():
         static_mode = mp4_load_config().get("static_video", "loop")
         static_label = {"loop": "Loop/stretch to audio length", "skip": "Skip (don't convert)"}.get(static_mode, static_mode)
         temp_cleanup = s.get("temp_cleanup", "auto")
-        temp_cleanup_label = {"auto": "Delete after each file", "keep": "Keep all temp files", "batch": "Delete after full run"}.get(temp_cleanup, temp_cleanup)
+        temp_cleanup_label = {"auto": "Delete after each file", "keep": "Keep all temp WAV/M2V", "batch": "Delete after full run"}.get(temp_cleanup, temp_cleanup)
         retry_count   = s.get("retry_count", 1)
         workers       = s.get("parallel_workers", 1)
         notify        = s.get("notify_on_complete", True)
@@ -1055,15 +1057,16 @@ def scene_settings():
             clear_screen()
             show_header()
             print("Settings — Temp File Cleanup\n")
-            print("  Controls when intermediate files (.m2v, .wav) are deleted.\n")
+            print("  Controls when intermediate temp files (.m2v, .wav) are deleted.")
+            print("  Output files (.mp3, .flac, .mp4) are never affected by this setting.\n")
             print(f"  [1] Delete after each file  {'*' if temp_cleanup == 'auto' else ''}")
-            print(f"  [2] Keep all temp files     {'*' if temp_cleanup == 'keep' else ''}")
+            print(f"  [2] Keep all temp WAV/M2V   {'*' if temp_cleanup == 'keep' else ''}")
             print(f"  [3] Delete after full run   {'*' if temp_cleanup == 'batch' else ''}")
             print()
             c6 = ask_choice("Enter choice: ", {"1", "2", "3"})
             new_cleanup = {"1": "auto", "2": "keep", "3": "batch"}[c6]
             update_setting("temp_cleanup", new_cleanup)
-            _label6 = {"auto": "Delete after each file", "keep": "Keep all temp files", "batch": "Delete after full run"}[new_cleanup]
+            _label6 = {"auto": "Delete after each file", "keep": "Keep all temp WAV/M2V", "batch": "Delete after full run"}[new_cleanup]
             print(f"\n  \u2713 Temp file cleanup set to: {_label6}")
             input("  Press Enter...")
         elif choice.lower() == "c":
@@ -2503,6 +2506,14 @@ def build_vgmstream_wav_command(awb_file: Path, temp_wav: Path, resolved_tools: 
 
 def build_ffmpeg_mp3_command(wav_file: Path, output_mp3: Path, resolved_tools: dict):
     return conv_build_ffmpeg_mp3_command(wav_file, output_mp3, resolved_tools)
+
+
+def get_preview_timing(acb_path: Path):
+    return conv_get_preview_timing(acb_path)
+
+
+def inject_demo_timing_into_maidata(maidata_path: Path, start_ms: int, end_ms: int) -> bool:
+    return conv_inject_demo_timing_into_maidata(maidata_path, start_ms, end_ms)
 
 
 def run_mp3_shell(payload, display_mode, resolved_tools):
@@ -4048,6 +4059,45 @@ def build_database_payload_from_args(args):
     }
 
 
+def _do_demo_inject(axxx_path: Path, output_dir: Path):
+    """Inject &demo_seek / &demo_len into all maidata.txt files in output_dir using ACB timing."""
+    sound_root = axxx_path / "SoundData"
+    music_root = axxx_path / "music"
+    if not sound_root.exists() or not music_root.exists() or not output_dir.exists():
+        return
+    awb_index = build_numeric_file_index(sound_root, ".awb")
+    timing_map: dict = {}
+    for xml in music_root.rglob("Music.xml"):
+        try:
+            meta = parse_music_xml_basic(xml)
+            sid = meta.get("song_id")
+            cid = meta.get("cue_id")
+            if sid is None:
+                continue
+            awb = resolve_awb_for_song(sound_root, awb_index, sid, cid or sid)
+            if awb is None:
+                continue
+            acb = awb.with_suffix(".acb")
+            if not acb.exists():
+                continue
+            t = get_preview_timing(acb)
+            if t:
+                timing_map[sid] = t
+        except Exception:
+            continue
+    for maidata in output_dir.rglob("maidata.txt"):
+        try:
+            text = maidata.read_text(encoding="utf-8-sig", errors="replace")
+            m = re.search(r"&shortid=(\d+)", text)
+            if not m:
+                continue
+            t = timing_map.get(int(m.group(1)))
+            if t:
+                inject_demo_timing_into_maidata(maidata, t[0], t[1])
+        except Exception:
+            continue
+
+
 def run_database_shell_single(payload, display_mode, resolved_tools):
     clear_screen()
     show_header()
@@ -4134,6 +4184,8 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
 
     if actual_output_dir.exists() and actual_output_dir.is_dir():
         if output_policy == "skip":
+            # Still inject demo timing even for skipped output
+            _do_demo_inject(Path(payload["axxx_path"]), actual_output_dir)
             payload["output_path"].mkdir(parents=True, exist_ok=True)
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write("=" * 80 + "\n")
@@ -4428,6 +4480,7 @@ def run_database_shell_single(payload, display_mode, resolved_tools):
                             safe_delete(_f)
 
         if returncode == 0:
+            _do_demo_inject(Path(payload["axxx_path"]), actual_output_dir)
             return 1, prep_missing, prep_failed, log_path
 
         return 0, prep_missing, prep_failed + 1, log_path

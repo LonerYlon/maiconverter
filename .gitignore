@@ -37,6 +37,14 @@ __pycache__/
 # Stale compiled binaries
 ._cache_*.exe
 
+# Binary tool directories (distributed separately via release zip)
+crid/
+ffmpeg/
+flac/
+maiforge/
+vgmstream-win64/
+assetstudiocli/
+
 # Saved presets (personal, not for repo)
 .db_presets.json
 .mas_settings.json

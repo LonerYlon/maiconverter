@@ -1,0 +1,12 @@
+cache:
+dns:
+email:
+logger: loguru
+models:
+monitoring:
+nosql:
+requests:
+secrets: secret_manager
+sftp:
+sql:
+storage:
